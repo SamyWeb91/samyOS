@@ -1,0 +1,17 @@
+# Binarios y objetos generados
+*.o
+*.bin
+*.img
+*.map
+*.elf
+
+# Copias de seguridad
+save/
+save2/
+bootloader.roto.*
+*.bak
+
+# Temporales
+*~
+*.swp
+.DS_Store
