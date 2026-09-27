@@ -4,6 +4,7 @@
 #include "pit.h"
 #include "io.h"
 #include "heap.h"
+#include "rtc.h"
 
 #define LINE_MAX 128
 
@@ -38,6 +39,7 @@ static void cmd_help() {
     screen_write("  clear         - limpiar pantalla\n");
     screen_write("  ticks         - ticks desde el arranque\n");
     screen_write("  uptime        - tiempo desde el arranque\n");
+    screen_write("  date          - fecha y hora del RTC\n");
     screen_write("  echo <texto>  - imprime el texto\n");
     screen_write("  cpuid         - informacion del CPU\n");
     screen_write("  mem           - memoria RAM detectada\n");
@@ -61,6 +63,13 @@ static void cmd_uptime() {
     unsigned int m = (t % 3600) / 60;
     unsigned int s = t % 60;
     kprintf("Uptime: %02u:%02u:%02u\n", h, m, s);
+}
+
+static void cmd_date() {
+    RTCTime t;
+    rtc_read(&t);
+    kprintf("Fecha: %02u/%02u/%u\n", t.day, t.month, t.year);
+    kprintf("Hora:  %02u:%02u:%02u\n", t.hour, t.minute, t.second);
 }
 
 static void cmd_echo(const char *args) {
@@ -229,7 +238,7 @@ static void cmd_heap() {
 }
 
 // =====================================================================
-// TEST: prueba de kmalloc/kfree
+// TEST
 // =====================================================================
 static void cmd_test() {
     kprintf("Asignando 3 bloques...\n");
@@ -297,6 +306,8 @@ static void execute(const char *l) {
         cmd_ticks();
     } else if (str_eq(l, "uptime")) {
         cmd_uptime();
+    } else if (str_eq(l, "date")) {
+        cmd_date();
     } else if (str_eq(l, "cpuid")) {
         cmd_cpuid();
     } else if (str_eq(l, "mem")) {
