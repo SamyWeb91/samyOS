@@ -1,14 +1,22 @@
 #pragma once
 
-// Llena el Page Directory y la Page Table. NO activa la paginacion.
-void paging_init();
+#ifdef __cplusplus
+extern "C" {
+#endif
 
-// Activa la paginacion cargando CR3 y poniendo el bit 31 de CR0.
-// Llamar SOLO despues de paging_init y con cuidado.
+void paging_init();
 void paging_enable_now();
 
-// Devuelve la direccion fisica del Page Directory
-unsigned int paging_get_pd_addr();
+void paging_map(unsigned int virt, unsigned int phys, unsigned int flags);
+void paging_map_range(unsigned int virt, unsigned int phys, unsigned int size_kb, unsigned int flags);
 
-// Devuelve la direccion fisica de la Page Table 0
+unsigned int paging_get_pd_addr();
 unsigned int paging_get_pt0_addr();
+
+#ifdef __cplusplus
+}
+#endif
+
+#define PTE_PRESENT  0x1
+#define PTE_RW       0x2
+#define PTE_USER     0x4

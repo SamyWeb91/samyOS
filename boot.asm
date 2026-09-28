@@ -1,19 +1,16 @@
 ; =====================================================================
-; Bootloader con captura de mapa E820
+; Bootloader con E820, sin VBE (modo texto para diagnostico)
 ; Compilar con: fasm boot.asm boot.bin
 ; =====================================================================
 format binary
 use16
 org 0x7C00
 
-; --- Punto de entrada ---
 start:
     jmp short boot_start
     nop
 
-; =====================================================================
-; BPB (BIOS Parameter Block) - Disquete 1.44MB
-; =====================================================================
+; --- BPB ---
 bpbOEM          db "MINIOS  "
 bpbBytesPerSec  dw 512
 bpbSecPerClus   db 1
@@ -35,7 +32,7 @@ bsVolLab        db "MINIOS     "
 bsFilSysType    db "FAT12   "
 
 ; =====================================================================
-; Código de arranque (modo real)
+; Arranque
 ; =====================================================================
 boot_start:
     cli
@@ -51,17 +48,9 @@ boot_start:
     mov si, msg_loading
     call print_string
 
-    ; =================================================================
-    ; Capturar mapa E820 de la BIOS
-    ; Guardamos:
-    ;   0x5000: uint32 num_entries
-    ;   0x5004: entradas de 24 bytes cada una
-    ; =================================================================
     call e820_capture
 
-    ; =================================================================
-    ; Cargar kernel desde sector 2 a 0x10000 (64 sectores = 32 KB)
-    ; =================================================================
+    ; --- Cargar kernel: 64 sectores desde LBA 1 a 0x10000 ---
     mov ax, 0x1000
     mov es, ax
     xor bx, bx
@@ -78,9 +67,6 @@ boot_start:
     mov si, msg_jump
     call print_string
 
-    ; =================================================================
-    ; Cambiar a modo protegido
-    ; =================================================================
     cli
     lgdt [gdt_descriptor]
 
@@ -91,57 +77,39 @@ boot_start:
     jmp 0x08:pm_start
 
 ; =====================================================================
-; e820_capture: recorre el mapa E820 y lo guarda en 0x5000
+; e820_capture
 ; =====================================================================
 e820_capture:
     pusha
-
-    ; ES:DI = 0x5004 (destino de las entradas)
     mov ax, 0x0000
     mov es, ax
     mov di, 0x5004
-
-    xor ebx, ebx           ; EBX = 0 (continuacion)
-    xor bp, bp             ; contador de entradas (usamos BP)
-
+    xor ebx, ebx
+    xor bp, bp
 .e820_loop:
     mov eax, 0xE820
-    mov edx, 0x534D4150    ; 'SMAP'
-    mov ecx, 24            ; tamano de la entrada
+    mov edx, 0x534D4150
+    mov ecx, 24
     int 0x15
-
-    ; CF=1 -> error o fin
-    jc .e820_done
-
-    ; EAX debe ser 'SMAP' tras la llamada
+    jc .done
     cmp eax, 0x534D4150
-    jne .e820_done
-
-    ; Si EBX = 0, hemos terminado
+    jne .done
     test ebx, ebx
-    jz .e820_done
-
-    ; Avanzar DI a la siguiente entrada
+    jz .done
     add di, 24
     inc bp
-
-    ; Limite de 64 entradas (suficiente)
     cmp bp, 64
-    jae .e820_done
-
+    jae .done
     jmp .e820_loop
-
-.e820_done:
-    ; Guardar el numero de entradas en 0x5000
+.done:
     mov ax, 0x0000
     mov es, ax
     mov [0x5000], bp
-
     popa
     ret
 
 ; =====================================================================
-; Código en modo protegido de 32 bits
+; Modo protegido
 ; =====================================================================
 use32
 pm_start:
@@ -152,21 +120,20 @@ pm_start:
     mov gs, ax
     mov ss, ax
     mov esp, 0x90000
-
     jmp 0x10000
 
 ; =====================================================================
-; Rutinas de modo real
+; Rutinas modo real
 ; =====================================================================
 use16
 print_string:
     mov ah, 0x0E
-.next_char:
+.next:
     lodsb
     cmp al, 0
     je .done
     int 0x10
-    jmp .next_char
+    jmp .next
 .done:
     ret
 
@@ -203,13 +170,10 @@ gdt_descriptor:
 ; =====================================================================
 ; Datos
 ; =====================================================================
-boot_drive  db 0
-msg_loading db "Cargando kernel...", 13, 10, 0
-msg_jump    db "Saltando a modo protegido...", 13, 10, 0
-msg_error   db "Error al leer el disco.", 13, 10, 0
+boot_drive    db 0
+msg_loading   db "Cargando kernel...", 13, 10, 0
+msg_jump      db "Saltando a modo protegido...", 13, 10, 0
+msg_error     db "Error al leer el disco.", 13, 10, 0
 
-; =====================================================================
-; Relleno y firma
-; =====================================================================
 times 510 - ($ - $$) db 0
 dw 0xAA55
