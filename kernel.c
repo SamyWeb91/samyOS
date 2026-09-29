@@ -9,10 +9,11 @@
 #include "paging.h"
 #include "gdt.h"
 #include "tss.h"
+#include "task.h"
 
 extern "C" void kernel_main() {
     screen_clear();
-    kprintf("MiniOS v1.2\n");
+    kprintf("MiniOS v1.3\n");
     kprintf("===========\n\n");
 
     gdt_init();
@@ -39,6 +40,9 @@ extern "C" void kernel_main() {
     paging_init();
     paging_enable_now();
     kprintf("Paginacion activada\n");
+
+    task_init();
+    kprintf("Sistema de tareas inicializado\n");
 
     asm volatile("sti");
 
