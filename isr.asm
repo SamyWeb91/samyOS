@@ -1,7 +1,18 @@
+; =====================================================================
+; isr.asm - Stubs de interrupciones y handler comun con cambio de tarea
+; Compilar con: fasm isr.asm isr.o
+; =====================================================================
 format ELF
 use32
 
+; =====================================================================
+; Funciones externas (definidas en C++)
+; =====================================================================
 extrn isr_handler
+extrn task_save_esp
+extrn schedule_next
+extrn task_set_current
+extrn task_get_current
 
 section '.text' executable
 
@@ -89,6 +100,23 @@ IRQ 15, 15
 
 ; =====================================================================
 ; isr_common
+;
+; Pila al entrar (despues de pusha):
+;   [esp+0]  = EDI
+;   [esp+4]  = ESI
+;   [esp+8]  = EBP
+;   [esp+12] = ESP
+;   [esp+16] = EBX
+;   [esp+20] = EDX
+;   [esp+24] = ECX
+;   [esp+28] = EAX
+;   [esp+32] = err_code
+;   [esp+36] = int_no      <-- aqui
+;   [esp+40] = EIP
+;   [esp+44] = CS
+;   [esp+48] = EFLAGS
+;
+; Espera: el stub IRQ empuja primero err_code, luego int_no.
 ; =====================================================================
 isr_common:
     pusha
@@ -97,9 +125,31 @@ isr_common:
     mov es, ax
     mov fs, ax
     mov gs, ax
+
     push esp
     call isr_handler
     add esp, 4
+
+    ; Comprobar si es IRQ0 (int_no == 32)
+    mov eax, [esp + 32]
+    cmp eax, 32
+    jne .no_switch
+
+    ; --- Es IRQ0: cambiar de tarea ---
+    push esp
+    call task_save_esp
+    add esp, 4
+
+    call schedule_next
+    push eax
+    call task_set_current
+    add esp, 4
+
+    call task_get_current
+    mov eax, [eax + 8]      ; current_task->esp
+    mov esp, eax            ; <-- CAMBIO DE PILA
+
+.no_switch:
     popa
     add esp, 8
     iretd

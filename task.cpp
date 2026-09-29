@@ -4,7 +4,7 @@
 
 static Task tasks[TASK_MAX];
 static Task *current_task = 0;
-static int task_count = 1;   // tarea 0 = kernel
+static int task_count = 1;
 
 extern "C" void task_init() {
     for (int i = 0; i < TASK_MAX; i++) {
@@ -18,21 +18,21 @@ extern "C" void task_init() {
 
     tasks[0].pid = 0;
     tasks[0].state = TASK_RUNNING;
-    tasks[0].esp = 0;
-    tasks[0].stack_base = 0;
-    tasks[0].eip = 0;
     tasks[0].next = &tasks[0];
-
     current_task = &tasks[0];
     task_count = 1;
 }
 
-extern "C" Task* task_get_current() {
-    return current_task;
+extern "C" Task* task_get_current() { return current_task; }
+extern "C" Task* task_get_list() { return tasks; }
+
+extern "C" void task_set_current(Task *t) {
+    current_task = t;
 }
 
-extern "C" Task* task_get_list() {
-    return tasks;
+extern "C" void task_save_esp(uint32_t esp) {
+    if (current_task)
+        current_task->esp = esp;
 }
 
 extern "C" int task_create(void (*entry)()) {
@@ -40,49 +40,47 @@ extern "C" int task_create(void (*entry)()) {
 
     int idx = task_count++;
 
-    // Alojar pila
     unsigned char *stack = (unsigned char*)kmalloc(TASK_STACK_SIZE);
-    if (!stack) {
-        task_count--;
-        return -1;
-    }
+    if (!stack) { task_count--; return -1; }
 
-    // La pila crece hacia abajo, asi que el ESP inicial apunta al final
     uint32_t *sp = (uint32_t*)(stack + TASK_STACK_SIZE);
 
-    // Preparar la pila como si la tarea hubiera sido interrumpida
-    // Orden de push (de arriba hacia abajo):
-    //   [EFLAGS]
-    //   [CS]
-    //   [EIP] = entry
-    //   [EAX, ECX, EDX, EBX, ESP, EBP, ESI, EDI]  (pusha)
-    //   [EFLAGS]  (pushf)
+    // Orden inverso al popa + iretd del isr_common
+    // Pila final (de [sp+0] a [sp+48]):
+    //   [sp+0]  = EDI      <- popa empieza aqui
+    //   [sp+4]  = ESI
+    //   [sp+8]  = EBP
+    //   [sp+12] = ESP
+    //   [sp+16] = EBX
+    //   [sp+20] = EDX
+    //   [sp+24] = ECX
+    //   [sp+28] = EAX
+    //   [sp+32] = int_no   (32)
+    //   [sp+36] = err_code (0)
+    //   [sp+40] = EIP
+    //   [sp+44] = CS
+    //   [sp+48] = EFLAGS
 
-    // pushf
-    sp--; *sp = 0x202;                 // EFLAGS con IF=1
+    sp--; *sp = 0x202;              // EFLAGS
+    sp--; *sp = 0x08;               // CS
+    sp--; *sp = (uint32_t)entry;    // EIP
+    sp--; *sp = 0;                  // err_code
+    sp--; *sp = 32;                 // int_no
+    sp--; *sp = 0;                  // EAX
+    sp--; *sp = 0;                  // ECX
+    sp--; *sp = 0;                  // EDX
+    sp--; *sp = 0;                  // EBX
+    sp--; *sp = 0;                  // ESP
+    sp--; *sp = 0;                  // EBP
+    sp--; *sp = 0;                  // ESI
+    sp--; *sp = 0;                  // EDI
 
-    // pusha (en orden inverso al popa)
-    sp--; *sp = 0;   // EDI
-    sp--; *sp = 0;   // ESI
-    sp--; *sp = 0;   // EBP
-    sp--; *sp = 0;   // ESP (ignorado por popa)
-    sp--; *sp = 0;   // EBX
-    sp--; *sp = 0;   // EDX
-    sp--; *sp = 0;   // ECX
-    sp--; *sp = 0;   // EAX
-
-    // La direccion de retorno del task_switch
-    // task_switch hace 'ret' al final, asi que ponemos el EIP de la tarea
-    sp--; *sp = (uint32_t)entry;
-
-    // Guardar el ESP
     tasks[idx].pid = idx;
     tasks[idx].state = TASK_READY;
     tasks[idx].esp = (uint32_t)sp;
     tasks[idx].stack_base = (uint32_t)stack;
     tasks[idx].eip = (uint32_t)entry;
 
-    // Añadir a la lista circular
     tasks[idx].next = tasks[0].next;
     tasks[0].next = &tasks[idx];
 
@@ -90,4 +88,24 @@ extern "C" int task_create(void (*entry)()) {
             idx, (uint32_t)entry, (uint32_t)stack);
 
     return idx;
+}
+
+extern "C" Task* schedule_next() {
+    Task *current = current_task;
+    Task *next = current->next;
+
+    int guard = 0;
+    while (next->state != TASK_READY && next != current && guard < TASK_MAX) {
+        next = next->next;
+        guard++;
+    }
+
+    if (next == current)
+        return current;
+
+    if (current->state == TASK_RUNNING)
+        current->state = TASK_READY;
+
+    next->state = TASK_RUNNING;
+    return next;
 }

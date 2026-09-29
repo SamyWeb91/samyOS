@@ -11,13 +11,11 @@ extern "C" void isr_handler(Regs *r) {
         while (1) {}
     } else if (r->int_no >= 32 && r->int_no <= 47) {
         unsigned int irq = r->int_no - 32;
-
         if (irq == 0) {
             pit_tick();
         } else if (irq == 1) {
             keyboard_handler();
         }
-
         pic_send_eoi(irq);
     }
 }

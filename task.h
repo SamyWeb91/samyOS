@@ -28,7 +28,10 @@ void task_init();
 int  task_create(void (*entry)());
 Task* task_get_current();
 Task* task_get_list();
-void task_switch(Task *old_task, Task *new_task);
+
+Task* schedule_next();
+void task_set_current(Task *t);
+void task_save_esp(uint32_t esp);
 
 #ifdef __cplusplus
 }

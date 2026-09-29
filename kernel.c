@@ -11,7 +11,6 @@
 #include "tss.h"
 #include "task.h"
 
-// Tareas de prueba
 static void task_a() {
     while (1) {
         kprintf("A");
@@ -28,7 +27,7 @@ static void task_b() {
 
 extern "C" void kernel_main() {
     screen_clear();
-    kprintf("MiniOS v1.4\n");
+    kprintf("MiniOS v1.5\n");
     kprintf("===========\n\n");
 
     gdt_init();
@@ -66,8 +65,7 @@ extern "C" void kernel_main() {
 
     asm volatile("sti");
 
-    // Bucle infinito de la tarea kernel
     while (1) {
-        // Aqui podria hacer schedule() manualmente, pero esperamos al timer
+        // El timer (IRQ0) se encarga del schedule
     }
 }
