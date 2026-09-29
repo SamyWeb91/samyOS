@@ -2,8 +2,14 @@
 #include "screen.h"
 
 static unsigned int page_directory[1024] __attribute__((aligned(4096)));
-static unsigned int page_table_0[1024]   __attribute__((aligned(4096)));
 
+// 4 Page Tables para los primeros 16 MB
+static unsigned int page_table_0[1024] __attribute__((aligned(4096)));
+static unsigned int page_table_1[1024] __attribute__((aligned(4096)));
+static unsigned int page_table_2[1024] __attribute__((aligned(4096)));
+static unsigned int page_table_3[1024] __attribute__((aligned(4096)));
+
+// Pool de Page Tables para mapear zonas fuera de los 16 MB (framebuffer, etc.)
 #define PT_POOL_SIZE 16
 static unsigned int pt_pool[PT_POOL_SIZE][1024] __attribute__((aligned(4096)));
 static int pt_pool_next = 0;
@@ -11,15 +17,44 @@ static int pt_pool_next = 0;
 extern "C" void paging_enable_asm(unsigned int pd_phys);
 
 extern "C" void paging_init() {
+    // Limpiar el Page Directory
     for (int i = 0; i < 1024; i++) {
         page_directory[i] = 0;
-        page_table_0[i]   = 0;
     }
 
+    // Limpiar las 4 Page Tables
     for (int i = 0; i < 1024; i++) {
-        page_table_0[i] = (i * 0x1000) | PTE_PRESENT | PTE_RW;
+        page_table_0[i] = 0;
+        page_table_1[i] = 0;
+        page_table_2[i] = 0;
+        page_table_3[i] = 0;
+    }
+
+    // PT0: 0x000000 - 0x3FFFFF (4 MB)
+    for (int i = 0; i < 1024; i++) {
+        page_table_0[i] = (0x000000 + i * 0x1000) | PTE_PRESENT | PTE_RW;
     }
     page_directory[0] = ((unsigned int)page_table_0) | PTE_PRESENT | PTE_RW;
+
+    // PT1: 0x400000 - 0x7FFFFF (4 MB)
+    for (int i = 0; i < 1024; i++) {
+        page_table_1[i] = (0x400000 + i * 0x1000) | PTE_PRESENT | PTE_RW;
+    }
+    page_directory[1] = ((unsigned int)page_table_1) | PTE_PRESENT | PTE_RW;
+
+    // PT2: 0x800000 - 0xBFFFFF (4 MB)
+    for (int i = 0; i < 1024; i++) {
+        page_table_2[i] = (0x800000 + i * 0x1000) | PTE_PRESENT | PTE_RW;
+    }
+    page_directory[2] = ((unsigned int)page_table_2) | PTE_PRESENT | PTE_RW;
+
+    // PT3: 0xC00000 - 0xFFFFFF (4 MB)
+    for (int i = 0; i < 1024; i++) {
+        page_table_3[i] = (0xC00000 + i * 0x1000) | PTE_PRESENT | PTE_RW;
+    }
+    page_directory[3] = ((unsigned int)page_table_3) | PTE_PRESENT | PTE_RW;
+
+    // 16 MB mapeados en total
 }
 
 extern "C" void paging_enable_now() {
