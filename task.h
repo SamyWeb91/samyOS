@@ -28,8 +28,6 @@ void task_init();
 int  task_create(void (*entry)());
 Task* task_get_current();
 Task* task_get_list();
-
-// Stub temporal (se reemplazara en el sub-paso 2B)
 void task_switch(Task *old_task, Task *new_task);
 
 #ifdef __cplusplus

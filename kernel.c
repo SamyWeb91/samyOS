@@ -11,9 +11,24 @@
 #include "tss.h"
 #include "task.h"
 
+// Tareas de prueba
+static void task_a() {
+    while (1) {
+        kprintf("A");
+        for (volatile int i = 0; i < 1000000; i++);
+    }
+}
+
+static void task_b() {
+    while (1) {
+        kprintf("B");
+        for (volatile int i = 0; i < 1000000; i++);
+    }
+}
+
 extern "C" void kernel_main() {
     screen_clear();
-    kprintf("MiniOS v1.3\n");
+    kprintf("MiniOS v1.4\n");
     kprintf("===========\n\n");
 
     gdt_init();
@@ -44,11 +59,15 @@ extern "C" void kernel_main() {
     task_init();
     kprintf("Sistema de tareas inicializado\n");
 
+    task_create(task_a);
+    task_create(task_b);
+
+    kprintf("\nIniciando multitarea...\n\n");
+
     asm volatile("sti");
 
-    kprintf("\nEscribe 'help' para ver los comandos.\n\n");
-
-    shell_run();
-
-    while (1) {}
+    // Bucle infinito de la tarea kernel
+    while (1) {
+        // Aqui podria hacer schedule() manualmente, pero esperamos al timer
+    }
 }
