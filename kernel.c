@@ -7,11 +7,19 @@
 #include "heap.h"
 #include "rtc.h"
 #include "paging.h"
+#include "gdt.h"
+#include "tss.h"
 
 extern "C" void kernel_main() {
     screen_clear();
-    kprintf("MiniOS v1.1\n");
+    kprintf("MiniOS v1.2\n");
     kprintf("===========\n\n");
+
+    gdt_init();
+    kprintf("GDT del kernel cargada\n");
+
+    tss_init();
+    kprintf("TSS inicializado\n");
 
     idt_init();
     kprintf("IDT cargada\n");
