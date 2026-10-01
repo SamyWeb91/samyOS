@@ -1,111 +1,114 @@
 #include "task.h"
-#include "heap.h"
 #include "screen.h"
 
-static Task tasks[TASK_MAX];
-static Task *current_task = 0;
-static int task_count = 1;
+static Task  tasks[TASK_MAX];
+static Task *current = 0;
+static int   count   = 0;
 
-extern "C" void task_init() {
+// Pilas estaticas -> siempre identity-mapped, no dependen de kmalloc
+static uint8_t stacks[TASK_MAX][TASK_STACK_SIZE]
+    __attribute__((aligned(16)));
+
+extern "C" void task_init(void) {
     for (int i = 0; i < TASK_MAX; i++) {
-        tasks[i].pid = 0;
-        tasks[i].state = TASK_FREE;
-        tasks[i].esp = 0;
-        tasks[i].stack_base = 0;
-        tasks[i].eip = 0;
-        tasks[i].next = 0;
+        tasks[i].pid   = 0;
+        tasks[i].state = 0;
+        tasks[i].esp   = 0;
+        tasks[i].next  = 0;
     }
 
-    tasks[0].pid = 0;
+    // Idle (PID 0): solo existe para arrancar
+    tasks[0].pid   = 0;
     tasks[0].state = TASK_RUNNING;
-    tasks[0].next = &tasks[0];
-    current_task = &tasks[0];
-    task_count = 1;
+    tasks[0].next  = &tasks[0];
+
+    current = &tasks[0];
+    count   = 1;
 }
 
-extern "C" Task* task_get_current() { return current_task; }
-extern "C" Task* task_get_list() { return tasks; }
+extern "C" Task *task_get_current(void) {
+    return current;
+}
 
 extern "C" void task_set_current(Task *t) {
-    current_task = t;
+    current = t;
 }
 
 extern "C" void task_save_esp(uint32_t esp) {
-    if (current_task)
-        current_task->esp = esp;
+    if (current) current->esp = esp;
 }
 
-extern "C" int task_create(void (*entry)()) {
-    if (task_count >= TASK_MAX) return -1;
+extern "C" int task_create(void (*entry)(void)) {
+    if (count >= TASK_MAX) return -1;
 
-    int idx = task_count++;
+    int idx = count++;
+    uint8_t *stack = stacks[idx];
+    uint32_t *sp = (uint32_t *)(stack + TASK_STACK_SIZE);
 
-    unsigned char *stack = (unsigned char*)kmalloc(TASK_STACK_SIZE);
-    if (!stack) { task_count--; return -1; }
-
-    uint32_t *sp = (uint32_t*)(stack + TASK_STACK_SIZE);
-
-    // Orden inverso al popa + iretd del isr_common
-    // Pila final (de [sp+0] a [sp+48]):
-    //   [sp+0]  = EDI      <- popa empieza aqui
+    // Pila final esperada por isr_common:
+    //   [sp+0]  = EDI
     //   [sp+4]  = ESI
     //   [sp+8]  = EBP
-    //   [sp+12] = ESP
+    //   [sp+12] = ESP (dummy)
     //   [sp+16] = EBX
     //   [sp+20] = EDX
     //   [sp+24] = ECX
     //   [sp+28] = EAX
-    //   [sp+32] = int_no   (32)
-    //   [sp+36] = err_code (0)
+    //   [sp+32] = int_no      (32)
+    //   [sp+36] = err_code    (0)
     //   [sp+40] = EIP
-    //   [sp+44] = CS
-    //   [sp+48] = EFLAGS
+    //   [sp+44] = CS          (0x08)
+    //   [sp+48] = EFLAGS      (0x202)
+    //
+    // Empujamos en orden inverso:
 
-    sp--; *sp = 0x202;              // EFLAGS
-    sp--; *sp = 0x08;               // CS
+    sp--; *sp = 0x202;              // EFLAGS (IF=1)
+    sp--; *sp = 0x08;               // CS kernel
     sp--; *sp = (uint32_t)entry;    // EIP
+
     sp--; *sp = 0;                  // err_code
-    sp--; *sp = 32;                 // int_no
+    sp--; *sp = 32;                 // int_no (IRQ0)
+
     sp--; *sp = 0;                  // EAX
     sp--; *sp = 0;                  // ECX
     sp--; *sp = 0;                  // EDX
     sp--; *sp = 0;                  // EBX
-    sp--; *sp = 0;                  // ESP
+    sp--; *sp = 0;                  // ESP (dummy)
     sp--; *sp = 0;                  // EBP
     sp--; *sp = 0;                  // ESI
-    sp--; *sp = 0;                  // EDI
+    sp--; *sp = 0;                  // EDI  <- sp apunta aqui
 
-    tasks[idx].pid = idx;
+    tasks[idx].pid   = idx;
     tasks[idx].state = TASK_READY;
-    tasks[idx].esp = (uint32_t)sp;
-    tasks[idx].stack_base = (uint32_t)stack;
-    tasks[idx].eip = (uint32_t)entry;
+    tasks[idx].esp   = (uint32_t)sp;
 
+    // Insertar en lista circular despues del idle
     tasks[idx].next = tasks[0].next;
-    tasks[0].next = &tasks[idx];
+    tasks[0].next   = &tasks[idx];
 
-    kprintf("Tarea creada: PID %d en %x (stack=%x)\n",
-            idx, (uint32_t)entry, (uint32_t)stack);
-
+    kprintf("Tarea %d lista (entry=%x)\n", idx, (uint32_t)entry);
     return idx;
 }
 
-extern "C" Task* schedule_next() {
-    Task *current = current_task;
-    Task *next = current->next;
+// Round-robin simple: salta el idle si hay tareas de usuario
+extern "C" Task *schedule_next(void) {
+    Task *c = current;
+    Task *n = c->next;
 
-    int guard = 0;
-    while (next->state != TASK_READY && next != current && guard < TASK_MAX) {
-        next = next->next;
-        guard++;
+    // Buscar la siguiente READY con pid != 0
+    for (int i = 0; i < TASK_MAX; i++) {
+        if (n->state == TASK_READY && n->pid != 0)
+            break;
+        n = n->next;
+        if (n == c) break;
     }
 
-    if (next == current)
-        return current;
+    // Si no hay nadie mas, quedarse
+    if (n == c || (n->state != TASK_READY && n->pid == 0))
+        return c;
 
-    if (current->state == TASK_RUNNING)
-        current->state = TASK_READY;
-
-    next->state = TASK_RUNNING;
-    return next;
+    if (c->state == TASK_RUNNING)
+        c->state = TASK_READY;
+    n->state = TASK_RUNNING;
+    return n;
 }

@@ -2,21 +2,16 @@
 
 #include <stdint.h>
 
-#define TASK_MAX        16
-#define TASK_STACK_SIZE 8192
+#define TASK_MAX        8
+#define TASK_STACK_SIZE 4096
 
-#define TASK_FREE      0
-#define TASK_READY     1
-#define TASK_RUNNING   2
-#define TASK_BLOCKED   3
-#define TASK_ZOMBIE    4
+#define TASK_READY   1
+#define TASK_RUNNING 2
 
 struct Task {
     uint32_t pid;
     uint32_t state;
-    uint32_t esp;
-    uint32_t stack_base;
-    uint32_t eip;
+    uint32_t esp;       // offset 8 -> usado en isr.asm
     Task    *next;
 };
 
@@ -24,14 +19,12 @@ struct Task {
 extern "C" {
 #endif
 
-void task_init();
-int  task_create(void (*entry)());
-Task* task_get_current();
-Task* task_get_list();
-
-Task* schedule_next();
-void task_set_current(Task *t);
-void task_save_esp(uint32_t esp);
+void  task_init(void);
+int   task_create(void (*entry)(void));
+Task *task_get_current(void);
+void  task_set_current(Task *t);
+void  task_save_esp(uint32_t esp);
+Task *schedule_next(void);
 
 #ifdef __cplusplus
 }

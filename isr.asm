@@ -1,13 +1,10 @@
 ; =====================================================================
-; isr.asm - Stubs de interrupciones y handler comun con cambio de tarea
+; isr.asm - Stubs de interrupciones y handler comun
 ; Compilar con: fasm isr.asm isr.o
 ; =====================================================================
 format ELF
 use32
 
-; =====================================================================
-; Funciones externas (definidas en C++)
-; =====================================================================
 extrn isr_handler
 extrn task_save_esp
 extrn schedule_next
@@ -110,16 +107,15 @@ IRQ 15, 15
 ;   [esp+20] = EDX
 ;   [esp+24] = ECX
 ;   [esp+28] = EAX
-;   [esp+32] = err_code
-;   [esp+36] = int_no      <-- aqui
+;   [esp+32] = int_no      <-- AQUI
+;   [esp+36] = err_code
 ;   [esp+40] = EIP
 ;   [esp+44] = CS
 ;   [esp+48] = EFLAGS
-;
-; Espera: el stub IRQ empuja primero err_code, luego int_no.
 ; =====================================================================
 isr_common:
     pusha
+
     mov ax, 0x10
     mov ds, ax
     mov es, ax
@@ -146,7 +142,7 @@ isr_common:
     add esp, 4
 
     call task_get_current
-    mov eax, [eax + 8]      ; current_task->esp
+    mov eax, [eax + 8]      ; Task.esp
     mov esp, eax            ; <-- CAMBIO DE PILA
 
 .no_switch:

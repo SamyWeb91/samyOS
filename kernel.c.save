@@ -1,0 +1,58 @@
+#include "screen.h"
+#include "idt.h"
+#include "pic.h"
+#include "pit.h"
+#include "keyboard.h"
+#include "heap.h"
+#include "paging.h"
+#include "gdt.h"
+#include "tss.h"
+#include "task.h"
+
+/* Escritura directa a la esquina de la pantalla (sin kprintf) */
+static void put_vga(char c, int col) {
+    volatile char *v = (volatile char *)0xB8000;
+    v[col * 2]     = c;
+    v[col * 2 + 1] = 0x0F;
+}
+
+static void task_a(void) {
+    int n = 0;
+    for (;;) {
+        put_vga('A', (n++) % 40);
+        for (volatile int i = 0; i < 100000; i++);
+    }
+}
+
+static void task_b(void) {
+    int n = 0;
+    for (;;) {
+        put_vga('B', 40 + (n++) % 40);
+        for (volatile int i = 0; i < 100000; i++);
+    }
+}
+
+extern "C" void kernel_main(void) {
+    screen_clear();
+    kprintf("MiniOS multitarea\n");
+
+    gdt_init();
+    tss_init();
+    idt_init();
+    pic_remap();
+    pit_init(100);
+    keyboard_init();
+    heap_init();
+    paging_init();
+    paging_enable_now();
+
+    task_init();
+    task_create(task_a);   /* PID 1 */
+    task_create(task_b);   /* PID 2 */
+
+    kprintf("GO\n");
+    asm volatile("sti");
+
+    for (;;)
+        asm volatile("hlt");
+}
