@@ -5,15 +5,13 @@
 #include "io.h"
 #include "heap.h"
 #include "rtc.h"
+#include "fs.h"
 
 #define LINE_MAX 128
 
 static char line[LINE_MAX];
 static int line_len = 0;
 
-// =====================================================================
-// Helpers de strings
-// =====================================================================
 static int str_eq(const char *a, const char *b) {
     while (*a && *b) {
         if (*a != *b) return 0;
@@ -31,7 +29,7 @@ static int str_starts_with(const char *str, const char *prefix) {
 }
 
 // =====================================================================
-// Comandos
+// Comandos basicos
 // =====================================================================
 static void cmd_help() {
     screen_write("Comandos disponibles:\n");
@@ -45,17 +43,17 @@ static void cmd_help() {
     screen_write("  mem           - memoria RAM detectada\n");
     screen_write("  heap          - estadisticas del heap\n");
     screen_write("  test          - prueba de kmalloc/kfree\n");
+    screen_write("  ls            - listar archivos\n");
+    screen_write("  touch <name>  - crear archivo\n");
+    screen_write("  write <a> <t> - escribir texto\n");
+    screen_write("  read <a>      - leer archivo\n");
+    screen_write("  rm <a>        - borrar archivo\n");
     screen_write("  reboot        - reiniciar el PC\n");
     screen_write("  shutdown      - apagar el PC\n");
 }
 
-static void cmd_clear() {
-    screen_clear();
-}
-
-static void cmd_ticks() {
-    kprintf("Ticks: %u\n", pit_get_ticks());
-}
+static void cmd_clear()   { screen_clear(); }
+static void cmd_ticks()   { kprintf("Ticks: %u\n", pit_get_ticks()); }
 
 static void cmd_uptime() {
     unsigned int t = pit_get_ticks() / 100;
@@ -117,7 +115,6 @@ static void cmd_cpuid() {
         unsigned int brand_id   = ebx & 0xFF;
         unsigned int clflush    = ((ebx >> 8) & 0xFF) * 8;
         unsigned int logical    = (ebx >> 16) & 0xFF;
-        unsigned int apic_id    = (ebx >> 24) & 0xFF;
 
         if (family == 0xF) family += ext_family;
         if (family == 0x6 || family == 0xF) model += (ext_model << 4);
@@ -125,27 +122,8 @@ static void cmd_cpuid() {
         kprintf("Familia: %u  Modelo: %u  Stepping: %u\n",
                 family, model, stepping);
         kprintf("Cores logicos: %u\n", logical);
-        kprintf("APIC ID: %u\n", apic_id);
         kprintf("Cache line: %u bytes\n", clflush);
         kprintf("Brand ID: %u\n", brand_id);
-
-        kprintf("Flags: ");
-        if (edx & (1 << 0))  kprintf("FPU ");
-        if (edx & (1 << 4))  kprintf("TSC ");
-        if (edx & (1 << 5))  kprintf("MSR ");
-        if (edx & (1 << 6))  kprintf("PAE ");
-        if (edx & (1 << 9))  kprintf("APIC ");
-        if (edx & (1 << 23)) kprintf("MMX ");
-        if (edx & (1 << 25)) kprintf("SSE ");
-        if (edx & (1 << 26)) kprintf("SSE2 ");
-        if (ecx & (1 << 0))  kprintf("SSE3 ");
-        if (ecx & (1 << 9))  kprintf("SSSE3 ");
-        if (ecx & (1 << 19)) kprintf("SSE4.1 ");
-        if (ecx & (1 << 20)) kprintf("SSE4.2 ");
-        if (ecx & (1 << 28)) kprintf("AVX ");
-        if (ecx & (1 << 29)) kprintf("F16C ");
-        if (ecx & (1 << 30)) kprintf("RDRAND ");
-        kprintf("\n");
     }
 
     cpuid_raw(0x80000000, 0, &eax, &ebx, &ecx, &edx);
@@ -161,25 +139,10 @@ static void cmd_cpuid() {
         brand[48] = 0;
         kprintf("Nombre: %s\n", brand);
     }
-
-    if (max_ext >= 0x80000006) {
-        cpuid_raw(0x80000006, 0, &eax, &ebx, &ecx, &edx);
-        unsigned int l2_size = (ecx >> 16) & 0xFFFF;
-        kprintf("Cache L2: %u KB\n", l2_size);
-    }
-
-    if (max_ext >= 0x80000007) {
-        cpuid_raw(0x80000007, 0, &eax, &ebx, &ecx, &edx);
-        if (edx & (1 << 8)) {
-            kprintf("TSC invariante: si\n");
-        } else {
-            kprintf("TSC invariante: no\n");
-        }
-    }
 }
 
 // =====================================================================
-// MEM: leer mapa E820 guardado por el bootloader en 0x5000
+// MEM
 // =====================================================================
 struct E820Entry {
     unsigned long long base;
@@ -190,7 +153,6 @@ struct E820Entry {
 
 static void cmd_mem() {
     unsigned int num = *(volatile unsigned int*)0x5000;
-
     if (num == 0 || num > 64) {
         screen_write("Mapa E820 no disponible.\n");
         return;
@@ -237,31 +199,15 @@ static void cmd_heap() {
     kprintf("Bloques:      %u total, %u libres\n", s.num_blocks, s.num_free);
 }
 
-// =====================================================================
-// TEST
-// =====================================================================
 static void cmd_test() {
     kprintf("Asignando 3 bloques...\n");
-
     void *a = kmalloc(1024);
     void *b = kmalloc(2048);
     void *c = kmalloc(4096);
-
     kprintf("  a=%x  b=%x  c=%x\n",
             (unsigned int)a, (unsigned int)b, (unsigned int)c);
 
-    HeapStats s1 = heap_get_stats();
-    kprintf("Despues de asignar: %u KB usados, %u bloques\n",
-            s1.used_size / 1024, s1.num_blocks);
-
-    kprintf("Liberando b...\n");
     kfree(b);
-
-    HeapStats s2 = heap_get_stats();
-    kprintf("Despues de liberar b: %u KB usados, %u bloques, %u libres\n",
-            s2.used_size / 1024, s2.num_blocks, s2.num_free);
-
-    kprintf("Liberando a y c...\n");
     kfree(a);
     kfree(c);
 
@@ -271,7 +217,74 @@ static void cmd_test() {
 }
 
 // =====================================================================
-// REBOOT
+// FS
+// =====================================================================
+static void cmd_ls() { fs_list(); }
+
+static void cmd_touch(const char *args) {
+    if (args[0] == 0) { screen_write("Uso: touch <nombre>\n"); return; }
+    int r = fs_create(args);
+    if (r < 0) kprintf("Error: %d\n", r);
+    else       kprintf("Creado: %s\n", args);
+}
+
+static void cmd_write(const char *args) {
+    if (args[0] == 0) { screen_write("Uso: write <archivo> <texto>\n"); return; }
+
+    char name[64];
+    int i = 0;
+    while (args[i] && args[i] != ' ' && i < 63) { name[i] = args[i]; i++; }
+    name[i] = 0;
+    if (args[i] == ' ') i++;
+    const char *text = args + i;
+
+    int fd = fs_open(name);
+    if (fd < 0) { kprintf("Error open: %d\n", fd); return; }
+
+    fs_seek(fd, fs_size(fd));
+
+    int len = 0;
+    while (text[len]) len++;
+
+    int w = fs_write(fd, text, len);
+    fs_close(fd);
+
+    if (w < 0) kprintf("Error write: %d\n", w);
+    else       kprintf("Escrito %d bytes en %s\n", w, name);
+}
+
+static void cmd_read(const char *args) {
+    if (args[0] == 0) { screen_write("Uso: read <archivo>\n"); return; }
+
+    int fd = fs_open(args);
+    if (fd < 0) { kprintf("Error: %d\n", fd); return; }
+
+    int size = fs_size(fd);
+    if (size <= 0) {
+        kprintf("%s (vacio)\n", args);
+        fs_close(fd);
+        return;
+    }
+
+    static char buf[FS_MAX_SIZE + 1];
+    int n = fs_read(fd, buf, FS_MAX_SIZE);
+    fs_close(fd);
+
+    buf[n] = 0;
+    kprintf("=== %s (%d bytes) ===\n", args, n);
+    screen_write(buf);
+    screen_write("\n");
+}
+
+static void cmd_rm(const char *args) {
+    if (args[0] == 0) { screen_write("Uso: rm <archivo>\n"); return; }
+    int r = fs_delete(args);
+    if (r < 0) kprintf("Error: %d\n", r);
+    else       kprintf("Borrado: %s\n", args);
+}
+
+// =====================================================================
+// REBOOT / SHUTDOWN
 // =====================================================================
 static void cmd_reboot() {
     screen_write("Reiniciando...\n");
@@ -283,55 +296,39 @@ static void cmd_reboot() {
     while (1) {}
 }
 
-// =====================================================================
-// SHUTDOWN
-// =====================================================================
 static void cmd_shutdown() {
     screen_write("Apagando...\n");
     outw(0x604, 0x2000);
     outw(0xB004, 0x2000);
     outw(0x4004, 0x3400);
-    screen_write("Shutdown no soportado en este hardware.\n");
+    screen_write("Shutdown no soportado.\n");
 }
 
 // =====================================================================
-// Dispatcher de comandos
+// Dispatcher
 // =====================================================================
 static void execute(const char *l) {
-    if (str_eq(l, "help")) {
-        cmd_help();
-    } else if (str_eq(l, "clear")) {
-        cmd_clear();
-    } else if (str_eq(l, "ticks")) {
-        cmd_ticks();
-    } else if (str_eq(l, "uptime")) {
-        cmd_uptime();
-    } else if (str_eq(l, "date")) {
-        cmd_date();
-    } else if (str_eq(l, "cpuid")) {
-        cmd_cpuid();
-    } else if (str_eq(l, "mem")) {
-        cmd_mem();
-    } else if (str_eq(l, "heap")) {
-        cmd_heap();
-    } else if (str_eq(l, "test")) {
-        cmd_test();
-    } else if (str_eq(l, "reboot")) {
-        cmd_reboot();
-    } else if (str_eq(l, "shutdown")) {
-        cmd_shutdown();
-    } else if (str_starts_with(l, "echo ")) {
-        cmd_echo(l + 5);
-    } else if (l[0] == 0) {
-        // linea vacia
-    } else {
-        kprintf("Comando desconocido: %s\n", l);
-    }
+    if (str_eq(l, "help"))              cmd_help();
+    else if (str_eq(l, "clear"))        cmd_clear();
+    else if (str_eq(l, "ticks"))        cmd_ticks();
+    else if (str_eq(l, "uptime"))       cmd_uptime();
+    else if (str_eq(l, "date"))         cmd_date();
+    else if (str_eq(l, "cpuid"))        cmd_cpuid();
+    else if (str_eq(l, "mem"))          cmd_mem();
+    else if (str_eq(l, "heap"))         cmd_heap();
+    else if (str_eq(l, "test"))         cmd_test();
+    else if (str_eq(l, "ls"))           cmd_ls();
+    else if (str_eq(l, "reboot"))       cmd_reboot();
+    else if (str_eq(l, "shutdown"))     cmd_shutdown();
+    else if (str_starts_with(l, "echo "))  cmd_echo(l + 5);
+    else if (str_starts_with(l, "touch ")) cmd_touch(l + 6);
+    else if (str_starts_with(l, "write ")) cmd_write(l + 6);
+    else if (str_starts_with(l, "read "))  cmd_read(l + 5);
+    else if (str_starts_with(l, "rm "))    cmd_rm(l + 3);
+    else if (l[0] == 0) { /* linea vacia */ }
+    else kprintf("Comando desconocido: %s\n", l);
 }
 
-// =====================================================================
-// Bucle de la shell
-// =====================================================================
 void shell_run() {
     kprintf("> ");
     line_len = 0;

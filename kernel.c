@@ -7,11 +7,12 @@
 #include "heap.h"
 #include "rtc.h"
 #include "paging.h"
+#include "fs.h"
 
-extern "C" void kernel_main() {
+extern "C" void kernel_main(void) {
     screen_clear();
-    kprintf("MiniOS v1.1\n");
-    kprintf("===========\n\n");
+    kprintf("MiniOS - FS en RAM\n");
+    kprintf("==================\n\n");
 
     idt_init();
     kprintf("IDT cargada\n");
@@ -31,6 +32,8 @@ extern "C" void kernel_main() {
     paging_init();
     paging_enable_now();
     kprintf("Paginacion activada\n");
+
+    fs_init();
 
     asm volatile("sti");
 
