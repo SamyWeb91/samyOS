@@ -8,10 +8,11 @@
 #include "rtc.h"
 #include "paging.h"
 #include "fs.h"
+#include "ahci.h"
 
 extern "C" void kernel_main(void) {
     screen_clear();
-    kprintf("MiniOS - FS en RAM\n");
+    kprintf("MiniOS - AHCI + FS\n");
     kprintf("==================\n\n");
 
     idt_init();
@@ -33,7 +34,18 @@ extern "C" void kernel_main(void) {
     paging_enable_now();
     kprintf("Paginacion activada\n");
 
+    // Mapear la zona MMIO del chipset (para AHCI)
+    paging_map_range(0xFE000000, 0xFE000000, 32768, PTE_PRESENT | PTE_RW);
+    kprintf("MMIO mapeado (0xFE000000 - 0xFFFFFFFF)\n");
+
     fs_init();
+
+    kprintf("\n");
+    if (ahci_init()) {
+        kprintf("AHCI listo\n");
+    } else {
+        kprintf("AHCI no disponible\n");
+    }
 
     asm volatile("sti");
 
