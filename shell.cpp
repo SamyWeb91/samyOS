@@ -51,6 +51,7 @@ static void cmd_help() {
     screen_write("  rm <a>        - borrar archivo\n");
     screen_write("  diskinfo      - info del disco SATA\n");
     screen_write("  diskread <lba> - leer sector del disco (hex)\n");
+    screen_write("  diskwrite <lba> <txt> - escribir sector del disco\n");
     screen_write("  reboot        - reiniciar el PC\n");
     screen_write("  shutdown      - apagar el PC\n");
 }
@@ -331,7 +332,6 @@ static void cmd_diskread(const char *args) {
     kprintf("  Primeros 64 bytes:\n");
 
     for (int row = 0; row < 4; row++) {
-        // Offset en hex, con padding manual (kprintf no soporta %04x)
         screen_write("  ");
         const char *hex = "0123456789ABCDEF";
         unsigned int off = row * 16;
@@ -341,7 +341,6 @@ static void cmd_diskread(const char *args) {
         screen_putchar(hex[off & 0xF]);
         screen_write(": ");
 
-        // Hex
         for (int col = 0; col < 16; col++) {
             unsigned char b = buf[row * 16 + col];
             screen_putchar(hex[(b >> 4) & 0xF]);
@@ -351,7 +350,6 @@ static void cmd_diskread(const char *args) {
 
         screen_write(" | ");
 
-        // ASCII
         for (int col = 0; col < 16; col++) {
             unsigned char b = buf[row * 16 + col];
             if (b >= 32 && b < 127) screen_putchar((char)b);
@@ -359,6 +357,51 @@ static void cmd_diskread(const char *args) {
         }
         screen_write("\n");
     }
+}
+
+// =====================================================================
+// DISCO: escribir un sector
+// =====================================================================
+static void cmd_diskwrite(const char *args) {
+    if (!ahci_is_ready()) {
+        screen_write("AHCI no disponible\n");
+        return;
+    }
+
+    if (args[0] == 0) {
+        screen_write("Uso: diskwrite <lba> <texto>\n");
+        return;
+    }
+
+    // Parsear LBA decimal
+    uint32_t lba = 0;
+    int i = 0;
+    while (args[i] >= '0' && args[i] <= '9') {
+        lba = lba * 10 + (args[i] - '0');
+        i++;
+    }
+    if (args[i] == ' ') i++;
+
+    const char *text = args + i;
+
+    // Preparar sector con ceros
+    static unsigned char buf[512];
+    for (int k = 0; k < 512; k++) buf[k] = 0;
+
+    // Copiar el texto (maximo 511 bytes)
+    int len = 0;
+    while (text[len] && len < 511) {
+        buf[len] = text[len];
+        len++;
+    }
+    buf[len] = 0;
+
+    if (!ahci_write_sector((uint64_t)lba, buf)) {
+        kprintf("Error escribiendo sector %u\n", lba);
+        return;
+    }
+
+    kprintf("Escritos %d bytes en sector %u\n", len, lba);
 }
 
 // =====================================================================
@@ -399,12 +442,13 @@ static void execute(const char *l) {
     else if (str_eq(l, "diskinfo"))     cmd_diskinfo();
     else if (str_eq(l, "reboot"))       cmd_reboot();
     else if (str_eq(l, "shutdown"))     cmd_shutdown();
-    else if (str_starts_with(l, "echo "))     cmd_echo(l + 5);
-    else if (str_starts_with(l, "touch "))    cmd_touch(l + 6);
-    else if (str_starts_with(l, "write "))    cmd_write(l + 6);
-    else if (str_starts_with(l, "read "))     cmd_read(l + 5);
-    else if (str_starts_with(l, "rm "))       cmd_rm(l + 3);
-    else if (str_starts_with(l, "diskread ")) cmd_diskread(l + 9);
+    else if (str_starts_with(l, "echo "))      cmd_echo(l + 5);
+    else if (str_starts_with(l, "touch "))     cmd_touch(l + 6);
+    else if (str_starts_with(l, "write "))     cmd_write(l + 6);
+    else if (str_starts_with(l, "read "))      cmd_read(l + 5);
+    else if (str_starts_with(l, "rm "))        cmd_rm(l + 3);
+    else if (str_starts_with(l, "diskread "))  cmd_diskread(l + 9);
+    else if (str_starts_with(l, "diskwrite ")) cmd_diskwrite(l + 10);
     else if (l[0] == 0) { /* linea vacia */ }
     else kprintf("Comando desconocido: %s\n", l);
 }

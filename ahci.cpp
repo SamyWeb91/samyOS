@@ -51,7 +51,7 @@
 
 #define PCI_CONFIG_ADDRESS  0xCF8
 #define PCI_CONFIG_DATA     0xCFC
-
+#define ATA_CMD_WRITE_DMA_EXT 0x35
 static uint32_t pci_read32(
     uint8_t bus,
     uint8_t device,
@@ -877,6 +877,13 @@ static int ahci_issue_command(
      */
     header->dw0 = 5 | (1U << 16);
 
+    // >>> CAMBIO AQUI: activar bit W (bit 6) para escritura
+    //     W = 0 -> Device -> Host (lectura)
+    //     W = 1 -> Host -> Device (escritura)
+    if (command == ATA_CMD_WRITE_DMA_EXT)
+        header->dw0 |= (1U << 6);
+    // <<< FIN CAMBIO
+
     /*
      * Lectura = W = 0.
      */
@@ -1511,6 +1518,54 @@ int ahci_read_sector(
     return 1;
 }
 
+// ============================================================
+// ESCRIBIR UN SECTOR
+// ============================================================
+
+extern "C"
+int ahci_write_sector(
+    uint64_t lba,
+    const void *buffer
+)
+{
+    if (!ahci_ready)
+        return 0;
+
+    if (!buffer)
+        return 0;
+
+    if (lba >= ahci_sector_count)
+    {
+        kprintf(
+            "AHCI: LBA fuera del disco: %u:%u\n",
+            (uint32_t)(lba >> 32),
+            (uint32_t)lba
+        );
+        return 0;
+    }
+
+    // Copiar los datos al buffer DMA alineado
+    memcpy8(
+        ahci_dma_buffer,
+        buffer,
+        512
+    );
+
+    // WRITE DMA EXT (0x35)
+    if (!ahci_issue_command(
+            ATA_CMD_WRITE_DMA_EXT,
+            lba,
+            1))
+    {
+        kprintf(
+            "AHCI: escritura fallida LBA=%u\n",
+            (uint32_t)lba
+        );
+        return 0;
+    }
+
+    return 1;
+}
 
 // ============================================================
 // INFORMACION
