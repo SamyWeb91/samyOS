@@ -12,6 +12,13 @@
 #define FS_ERR_NOENT  -3
 #define FS_ERR_NOSPC  -4
 #define FS_ERR_PARAM  -5
+#define FS_ERR_IO     -6
+
+// --- Layout en disco ---
+#define FS_DISK_LBA       2048
+#define FS_SECTORS_PER_FILE  9   // 1 metadatos + 8 datos
+#define FS_DATA_SECTORS      8   // 8 × 512 = 4096
+#define FS_MAGIC          0x4D494E49u   // "MINI"
 
 struct FSFile {
     char          name[FS_MAX_NAME];
@@ -34,6 +41,10 @@ int  fs_close(int fd);
 int  fs_delete(const char *name);
 void fs_list(void);
 int  fs_size(int fd);
+
+// --- Nuevas ---
+void fs_flush(void);       // forzar escritura a disco
+void fs_format(void);      // borrar todo el FS
 
 #ifdef __cplusplus
 }

@@ -38,14 +38,17 @@ extern "C" void kernel_main(void) {
     paging_map_range(0xFE000000, 0xFE000000, 32768, PTE_PRESENT | PTE_RW);
     kprintf("MMIO mapeado (0xFE000000 - 0xFFFFFFFF)\n");
 
-    fs_init();
-
+    // AHCI debe inicializarse ANTES que el FS,
+    // porque fs_init() lee del disco vía AHCI.
     kprintf("\n");
     if (ahci_init()) {
         kprintf("AHCI listo\n");
     } else {
         kprintf("AHCI no disponible\n");
     }
+
+    // Ahora sí, el FS puede leer/escribir en disco.
+    fs_init();
 
     asm volatile("sti");
 

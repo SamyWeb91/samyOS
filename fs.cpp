@@ -1,10 +1,36 @@
 #include "fs.h"
 #include "screen.h"
+#include "ahci.h"
 
-static FSFile files[FS_MAX_FILES];
+// =====================================================================
+// Estructuras en disco
+// =====================================================================
+struct FSSuperblock {
+    uint32_t magic;
+    uint32_t version;
+    uint32_t num_files;
+    uint32_t reserved;
+    uint8_t  pad[496];
+} __attribute__((packed));
+
+struct FSFileMeta {
+    char     name[FS_MAX_NAME];
+    uint32_t size;
+    uint32_t used;
+    uint8_t  pad[472];
+} __attribute__((packed));
+
+// =====================================================================
+// Cache en RAM
+// =====================================================================
+static FSFile   files[FS_MAX_FILES];
 static unsigned char data[FS_MAX_FILES][FS_MAX_SIZE];
-static unsigned int pos[FS_MAX_FILES];
+static unsigned int  pos[FS_MAX_FILES];
+static uint8_t  dirty[FS_MAX_FILES];   // 1 = datos modificados, volcar en close
 
+// =====================================================================
+// Helpers de string
+// =====================================================================
 static int str_eq(const char *a, const char *b) {
     while (*a && *b) {
         if (*a != *b) return 0;
@@ -22,24 +48,174 @@ static void str_copy(char *dst, const char *src, int max) {
     dst[i] = 0;
 }
 
-static int str_len(const char *s) {
-    int n = 0;
-    while (s[n]) n++;
-    return n;
+// =====================================================================
+// Layout en disco
+// =====================================================================
+// LBA 2048           : superbloque
+// LBA 2049 + i*9     : metadatos archivo i
+// LBA 2050 + i*9 ..  : datos archivo i (8 sectores)
+//
+// IMPORTANTE: ahci_read_sector / ahci_write_sector retornan:
+//   1 = exito
+//   0 = error
+// Por eso todas las comprobaciones usan "== 0" para detectar fallo.
+// =====================================================================
+static uint64_t meta_lba(int i)  { return FS_DISK_LBA + 1 + (uint64_t)i * FS_SECTORS_PER_FILE; }
+static uint64_t data_lba(int i)  { return meta_lba(i) + 1; }
+
+// =====================================================================
+// Escritura/lectura de metadatos de UN archivo
+// =====================================================================
+static int write_meta(int i) {
+    FSFileMeta m;
+    for (int k = 0; k < FS_MAX_NAME; k++) m.name[k] = files[i].name[k];
+    m.size = files[i].size;
+    m.used = files[i].used ? 1 : 0;
+    for (int k = 0; k < 472; k++) m.pad[k] = 0;
+
+    if (ahci_write_sector(meta_lba(i), &m) == 0) {
+        kprintf("FS: error escribiendo meta %d\n", i);
+        return FS_ERR_IO;
+    }
+    return FS_OK;
 }
 
-extern "C" void fs_init(void) {
+static int read_meta(int i) {
+    FSFileMeta m;
+    if (ahci_read_sector(meta_lba(i), &m) == 0) {
+        return FS_ERR_IO;
+    }
+    for (int k = 0; k < FS_MAX_NAME; k++) files[i].name[k] = m.name[k];
+    files[i].name[FS_MAX_NAME - 1] = 0;
+    files[i].size = m.size;
+    files[i].used = m.used ? 1 : 0;
+    files[i].open = 0;
+    pos[i] = 0;
+    return FS_OK;
+}
+
+// =====================================================================
+// Escritura/lectura de datos de UN archivo (8 sectores)
+// =====================================================================
+static int write_data(int i) {
+    uint64_t base = data_lba(i);
+    for (int s = 0; s < FS_DATA_SECTORS; s++) {
+        const void *src = &data[i][s * 512];
+        if (ahci_write_sector(base + s, src) == 0) {
+            kprintf("FS: error escribiendo datos %d sector %d\n", i, s);
+            return FS_ERR_IO;
+        }
+    }
+    return FS_OK;
+}
+
+static int read_data(int i) {
+    uint64_t base = data_lba(i);
+    for (int s = 0; s < FS_DATA_SECTORS; s++) {
+        void *dst = &data[i][s * 512];
+        if (ahci_read_sector(base + s, dst) == 0) {
+            kprintf("FS: error leyendo datos %d sector %d\n", i, s);
+            return FS_ERR_IO;
+        }
+    }
+    return FS_OK;
+}
+
+// =====================================================================
+// Superbloque
+// =====================================================================
+static int write_super(uint32_t num_files) {
+    FSSuperblock sb;
+    sb.magic     = FS_MAGIC;
+    sb.version   = 1;
+    sb.num_files = num_files;
+    sb.reserved  = 0;
+    for (int k = 0; k < 496; k++) sb.pad[k] = 0;
+
+    if (ahci_write_sector(FS_DISK_LBA, &sb) == 0) {
+        kprintf("FS: error escribiendo superbloque\n");
+        return FS_ERR_IO;
+    }
+    return FS_OK;
+}
+
+static int read_super(FSSuperblock *sb) {
+    if (ahci_read_sector(FS_DISK_LBA, sb) == 0) return FS_ERR_IO;
+    return FS_OK;
+}
+
+// =====================================================================
+// Formatear el FS (borra todo)
+// =====================================================================
+extern "C" void fs_format(void) {
+    kprintf("FS: formateando disco (LBA %u)...\n", (unsigned)FS_DISK_LBA);
+
     for (int i = 0; i < FS_MAX_FILES; i++) {
         files[i].name[0] = 0;
         files[i].size    = 0;
         files[i].used    = 0;
         files[i].open    = 0;
         pos[i]           = 0;
+        dirty[i]         = 0;
+        for (int k = 0; k < FS_MAX_SIZE; k++) data[i][k] = 0;
     }
-    kprintf("FS: inicializado (%d archivos max, %d bytes cada uno)\n",
-            FS_MAX_FILES, FS_MAX_SIZE);
+
+    write_super(0);
+
+    // Escribir 16 metadatos vacíos
+    for (int i = 0; i < FS_MAX_FILES; i++) {
+        write_meta(i);
+    }
+
+    kprintf("FS: formateado\n");
 }
 
+// =====================================================================
+// Init
+// =====================================================================
+extern "C" void fs_init(void) {
+    if (!ahci_is_ready()) {
+        kprintf("FS: AHCI no disponible, FS en RAM solamente\n");
+        for (int i = 0; i < FS_MAX_FILES; i++) {
+            files[i].name[0] = 0;
+            files[i].size    = 0;
+            files[i].used    = 0;
+            files[i].open    = 0;
+            pos[i]           = 0;
+            dirty[i]         = 0;
+        }
+        return;
+    }
+
+    FSSuperblock sb;
+    if (read_super(&sb) != FS_OK) {
+        kprintf("FS: error leyendo superbloque, formateando\n");
+        fs_format();
+        return;
+    }
+
+    if (sb.magic != FS_MAGIC || sb.version != 1) {
+        kprintf("FS: disco sin FS valido, formateando\n");
+        fs_format();
+        return;
+    }
+
+    // Cargar metadatos (los datos se cargan en fs_open)
+    int count = 0;
+    for (int i = 0; i < FS_MAX_FILES; i++) {
+        if (read_meta(i) != FS_OK) {
+            kprintf("FS: error leyendo meta %d\n", i);
+        }
+        dirty[i] = 0;
+        if (files[i].used) count++;
+    }
+
+    kprintf("FS: cargado desde disco (%d archivos)\n", count);
+}
+
+// =====================================================================
+// Búsqueda
+// =====================================================================
 static int find_free(void) {
     for (int i = 0; i < FS_MAX_FILES; i++) {
         if (!files[i].used) return i;
@@ -54,6 +230,15 @@ static int find_by_name(const char *name) {
     return -1;
 }
 
+static int count_used(void) {
+    int n = 0;
+    for (int i = 0; i < FS_MAX_FILES; i++) if (files[i].used) n++;
+    return n;
+}
+
+// =====================================================================
+// Create
+// =====================================================================
 extern "C" int fs_create(const char *name) {
     if (!name || name[0] == 0) return FS_ERR_PARAM;
     if (find_by_name(name) >= 0) return FS_ERR_EXISTS;
@@ -65,10 +250,21 @@ extern "C" int fs_create(const char *name) {
     files[idx].size = 0;
     files[idx].used = 1;
     files[idx].open = 0;
-    pos[idx] = 0;
+    pos[idx]        = 0;
+    dirty[idx]      = 0;
+
+    // Limpiar datos en RAM
+    for (int k = 0; k < FS_MAX_SIZE; k++) data[idx][k] = 0;
+
+    write_meta(idx);
+    write_super((uint32_t)count_used());
+
     return idx;
 }
 
+// =====================================================================
+// Open (carga datos del disco a RAM)
+// =====================================================================
 extern "C" int fs_open(const char *name) {
     if (!name) return FS_ERR_PARAM;
 
@@ -78,11 +274,19 @@ extern "C" int fs_open(const char *name) {
         if (idx < 0) return idx;
     }
 
+    // Cargar datos solo si no están dirty (ya en RAM)
+    if (!dirty[idx]) {
+        read_data(idx);
+    }
+
     files[idx].open++;
     pos[idx] = 0;
     return idx;
 }
 
+// =====================================================================
+// Write (a RAM, marca dirty)
+// =====================================================================
 extern "C" int fs_write(int fd, const void *buf, unsigned int len) {
     if (fd < 0 || fd >= FS_MAX_FILES) return FS_ERR_PARAM;
     if (!files[fd].used) return FS_ERR_NOENT;
@@ -100,9 +304,13 @@ extern "C" int fs_write(int fd, const void *buf, unsigned int len) {
     if (pos[fd] > files[fd].size) {
         files[fd].size = pos[fd];
     }
+    dirty[fd] = 1;
     return (int)len;
 }
 
+// =====================================================================
+// Read (desde RAM)
+// =====================================================================
 extern "C" int fs_read(int fd, void *buf, unsigned int len) {
     if (fd < 0 || fd >= FS_MAX_FILES) return FS_ERR_PARAM;
     if (!files[fd].used) return FS_ERR_NOENT;
@@ -124,6 +332,9 @@ extern "C" int fs_read(int fd, void *buf, unsigned int len) {
     return (int)len;
 }
 
+// =====================================================================
+// Seek
+// =====================================================================
 extern "C" int fs_seek(int fd, unsigned int offset) {
     if (fd < 0 || fd >= FS_MAX_FILES) return FS_ERR_PARAM;
     if (!files[fd].used) return FS_ERR_NOENT;
@@ -133,14 +344,26 @@ extern "C" int fs_seek(int fd, unsigned int offset) {
     return FS_OK;
 }
 
+// =====================================================================
+// Close (flush si dirty)
+// =====================================================================
 extern "C" int fs_close(int fd) {
     if (fd < 0 || fd >= FS_MAX_FILES) return FS_ERR_PARAM;
     if (!files[fd].used) return FS_ERR_NOENT;
+
+    if (dirty[fd]) {
+        write_data(fd);
+        write_meta(fd);
+        dirty[fd] = 0;
+    }
 
     if (files[fd].open > 0) files[fd].open--;
     return FS_OK;
 }
 
+// =====================================================================
+// Delete
+// =====================================================================
 extern "C" int fs_delete(const char *name) {
     if (!name) return FS_ERR_PARAM;
 
@@ -152,15 +375,40 @@ extern "C" int fs_delete(const char *name) {
     files[idx].name[0] = 0;
     files[idx].open = 0;
     pos[idx] = 0;
+    dirty[idx] = 0;
+
+    write_meta(idx);
+    write_super((uint32_t)count_used());
+
     return FS_OK;
 }
 
+// =====================================================================
+// Size
+// =====================================================================
 extern "C" int fs_size(int fd) {
     if (fd < 0 || fd >= FS_MAX_FILES) return FS_ERR_PARAM;
     if (!files[fd].used) return FS_ERR_NOENT;
     return (int)files[fd].size;
 }
 
+// =====================================================================
+// Flush manual (por si acaso)
+// =====================================================================
+extern "C" void fs_flush(void) {
+    for (int i = 0; i < FS_MAX_FILES; i++) {
+        if (dirty[i]) {
+            write_data(i);
+            write_meta(i);
+            dirty[i] = 0;
+        }
+    }
+    write_super((uint32_t)count_used());
+}
+
+// =====================================================================
+// List
+// =====================================================================
 extern "C" void fs_list(void) {
     int count = 0;
     unsigned int total = 0;
@@ -169,9 +417,9 @@ extern "C" void fs_list(void) {
     for (int i = 0; i < FS_MAX_FILES; i++) {
         if (!files[i].used) continue;
 
-        // Padding manual en lugar de %-16s (kprintf no lo soporta)
         kprintf("  %s", files[i].name);
-        int len = str_len(files[i].name);
+        int len = 0;
+        while (files[i].name[len]) len++;
         for (int j = len; j < 16; j++) screen_putchar(' ');
 
         kprintf("  %u bytes", files[i].size);

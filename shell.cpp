@@ -275,10 +275,6 @@ static void cmd_df() {
             FS_MAX_FILES, FS_MAX_SIZE);
     kprintf("Capacidad total: %u KB\n",
             (FS_MAX_FILES * FS_MAX_SIZE) / 1024);
-
-    // Recorrer el FS contando
-    // (necesitamos acceso a las estadisticas, que no expone fs.h)
-    // Por ahora, mostrar un mensaje
     kprintf("(usa 'ls' para ver archivos)\n");
 }
 
@@ -325,7 +321,6 @@ static void cmd_append(const char *args) {
     int fd = fs_open(name);
     if (fd < 0) { kprintf("Error open: %d\n", fd); return; }
 
-    // Escribir al final + salto de linea
     fs_seek(fd, fs_size(fd));
     int len = str_len(text);
     int w = fs_write(fd, text, len);
@@ -390,7 +385,6 @@ static void cmd_cp(const char *args) {
         return;
     }
 
-    // Abrir origen
     int fd_src = fs_open(src);
     if (fd_src < 0) { kprintf("Error abriendo %s: %d\n", src, fd_src); return; }
 
@@ -401,12 +395,10 @@ static void cmd_cp(const char *args) {
         return;
     }
 
-    // Leer todo
     static char buf[FS_MAX_SIZE + 1];
     int n = fs_read(fd_src, buf, FS_MAX_SIZE);
     fs_close(fd_src);
 
-    // Crear destino
     int fd_dst = fs_create(dst);
     if (fd_dst < 0) { kprintf("Error creando %s: %d\n", dst, fd_dst); return; }
 
@@ -424,7 +416,6 @@ static void cmd_mv(const char *args) {
         return;
     }
 
-    // Abrir origen
     int fd_src = fs_open(src);
     if (fd_src < 0) { kprintf("Error abriendo %s: %d\n", src, fd_src); return; }
 
@@ -435,19 +426,16 @@ static void cmd_mv(const char *args) {
         return;
     }
 
-    // Leer todo
     static char buf[FS_MAX_SIZE + 1];
     int n = fs_read(fd_src, buf, FS_MAX_SIZE);
     fs_close(fd_src);
 
-    // Crear destino
     int fd_dst = fs_create(dst);
     if (fd_dst < 0) { kprintf("Error creando %s: %d\n", dst, fd_dst); return; }
 
     fs_write(fd_dst, buf, n);
     fs_close(fd_dst);
 
-    // Borrar origen
     fs_delete(src);
 
     kprintf("Renombrado %s a %s (%d bytes)\n", src, dst, n);
@@ -511,14 +499,6 @@ static void cmd_stat(const char *args) {
 
 static void cmd_find(const char *args) {
     if (args[0] == 0) { screen_write("Uso: find <texto>\n"); return; }
-
-    // Recorrer todos los archivos del FS buscando el texto
-    // Como no tenemos acceso directo, iteramos sobre nombres
-    // Pero fs_list no expone nombres individuales.
-    // Solucion: usar fs_open con nombres conocidos no sirve.
-    // Necesitamos exponer una funcion en fs.h para iterar.
-
-    // Por ahora, mensaje
     screen_write("find: pendiente de implementar iteracion del FS\n");
 }
 
@@ -540,7 +520,6 @@ static void cmd_grep(const char *args) {
     fs_close(fd);
     buf[n] = 0;
 
-    // Buscar pattern en buf
     int plen = str_len(pattern);
     int found = 0;
 
@@ -550,7 +529,6 @@ static void cmd_grep(const char *args) {
             if (buf[i + j] != pattern[j]) { match = 0; break; }
         }
         if (match) {
-            // Mostrar la linea completa
             int start = i;
             while (start > 0 && buf[start - 1] != '\n') start--;
             int end = i;
@@ -621,11 +599,9 @@ static void cmd_tail(const char *args) {
     fs_close(fd);
     buf[n] = 0;
 
-    // Contar lineas totales
     int total_lines = 0;
     for (int i = 0; i < n; i++) if (buf[i] == '\n') total_lines++;
 
-    // Encontrar desde donde imprimir
     int skip = total_lines - n_lines;
     if (skip < 0) skip = 0;
 
@@ -664,6 +640,13 @@ static void cmd_diskread(const char *args) {
     }
 
     if (args[0] == 0) {
+        screen_write("Uso: diskread <lba>\n");
+        return;
+    }
+
+    // Validar que empiece con digito
+    if (args[0] < '0' || args[0] > '9') {
+        screen_write("Error: <lba> debe ser un numero\n");
         screen_write("Uso: diskread <lba>\n");
         return;
     }
@@ -717,6 +700,13 @@ static void cmd_diskwrite(const char *args) {
     }
 
     if (args[0] == 0) {
+        screen_write("Uso: diskwrite <lba> <texto>\n");
+        return;
+    }
+
+    // Validar que empiece con digito
+    if (args[0] < '0' || args[0] > '9') {
+        screen_write("Error: <lba> debe ser un numero\n");
         screen_write("Uso: diskwrite <lba> <texto>\n");
         return;
     }
