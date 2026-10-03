@@ -29,6 +29,12 @@ static int str_starts_with(const char *str, const char *prefix) {
     return 1;
 }
 
+static int str_len(const char *s) {
+    int n = 0;
+    while (s[n]) n++;
+    return n;
+}
+
 // =====================================================================
 // Comandos basicos
 // =====================================================================
@@ -43,15 +49,27 @@ static void cmd_help() {
     screen_write("  cpuid         - informacion del CPU\n");
     screen_write("  mem           - memoria RAM detectada\n");
     screen_write("  heap          - estadisticas del heap\n");
+    screen_write("  free          - memoria libre\n");
     screen_write("  test          - prueba de kmalloc/kfree\n");
     screen_write("  ls            - listar archivos\n");
+    screen_write("  df            - espacio del FS\n");
     screen_write("  touch <name>  - crear archivo\n");
     screen_write("  write <a> <t> - escribir texto\n");
+    screen_write("  append <a> <t> - anadir texto al final\n");
     screen_write("  read <a>      - leer archivo\n");
+    screen_write("  cat <a>       - mostrar archivo\n");
+    screen_write("  cp <a> <b>    - copiar archivo\n");
+    screen_write("  mv <a> <b>    - renombrar archivo\n");
     screen_write("  rm <a>        - borrar archivo\n");
+    screen_write("  wc <a>        - contar lineas/palabras/bytes\n");
+    screen_write("  stat <a>      - info del archivo\n");
+    screen_write("  find <txt>    - buscar texto en todos los archivos\n");
+    screen_write("  grep <txt> <a> - buscar texto en un archivo\n");
+    screen_write("  head <a> <n>  - primeras N lineas\n");
+    screen_write("  tail <a> <n>  - ultimas N lineas\n");
     screen_write("  diskinfo      - info del disco SATA\n");
-    screen_write("  diskread <lba> - leer sector del disco (hex)\n");
-    screen_write("  diskwrite <lba> <txt> - escribir sector del disco\n");
+    screen_write("  diskread <lba> - leer sector del disco\n");
+    screen_write("  diskwrite <lba> <txt> - escribir sector\n");
     screen_write("  reboot        - reiniciar el PC\n");
     screen_write("  shutdown      - apagar el PC\n");
 }
@@ -77,6 +95,27 @@ static void cmd_date() {
 static void cmd_echo(const char *args) {
     screen_write(args);
     screen_write("\n");
+}
+
+// =====================================================================
+// Helpers para parsear args
+// =====================================================================
+static int parse_args(const char *args, char *a1, char *a2, int a1max, int a2max) {
+    int i = 0;
+    while (args[i] && args[i] != ' ' && i < a1max - 1) {
+        a1[i] = args[i];
+        i++;
+    }
+    a1[i] = 0;
+
+    if (args[i] == 0) return 1;   // solo 1 argumento
+    i++;
+    int j = 0;
+    while (args[i] && j < a2max - 1) {
+        a2[j++] = args[i++];
+    }
+    a2[j] = 0;
+    return 2;
 }
 
 // =====================================================================
@@ -203,6 +242,12 @@ static void cmd_heap() {
     kprintf("Bloques:      %u total, %u libres\n", s.num_blocks, s.num_free);
 }
 
+static void cmd_free() {
+    HeapStats s = heap_get_stats();
+    kprintf("Memoria libre: %u KB\n", s.free_size / 1024);
+    kprintf("Memoria usada: %u KB\n", s.used_size / 1024);
+}
+
 static void cmd_test() {
     kprintf("Asignando 3 bloques...\n");
     void *a = kmalloc(1024);
@@ -224,6 +269,18 @@ static void cmd_test() {
 // FS
 // =====================================================================
 static void cmd_ls() { fs_list(); }
+
+static void cmd_df() {
+    kprintf("FS: %d archivos max, %d bytes cada uno\n",
+            FS_MAX_FILES, FS_MAX_SIZE);
+    kprintf("Capacidad total: %u KB\n",
+            (FS_MAX_FILES * FS_MAX_SIZE) / 1024);
+
+    // Recorrer el FS contando
+    // (necesitamos acceso a las estadisticas, que no expone fs.h)
+    // Por ahora, mostrar un mensaje
+    kprintf("(usa 'ls' para ver archivos)\n");
+}
 
 static void cmd_touch(const char *args) {
     if (args[0] == 0) { screen_write("Uso: touch <nombre>\n"); return; }
@@ -247,14 +304,39 @@ static void cmd_write(const char *args) {
 
     fs_seek(fd, fs_size(fd));
 
-    int len = 0;
-    while (text[len]) len++;
-
+    int len = str_len(text);
     int w = fs_write(fd, text, len);
     fs_close(fd);
 
     if (w < 0) kprintf("Error write: %d\n", w);
     else       kprintf("Escrito %d bytes en %s\n", w, name);
+}
+
+static void cmd_append(const char *args) {
+    if (args[0] == 0) { screen_write("Uso: append <archivo> <texto>\n"); return; }
+
+    char name[64];
+    int i = 0;
+    while (args[i] && args[i] != ' ' && i < 63) { name[i] = args[i]; i++; }
+    name[i] = 0;
+    if (args[i] == ' ') i++;
+    const char *text = args + i;
+
+    int fd = fs_open(name);
+    if (fd < 0) { kprintf("Error open: %d\n", fd); return; }
+
+    // Escribir al final + salto de linea
+    fs_seek(fd, fs_size(fd));
+    int len = str_len(text);
+    int w = fs_write(fd, text, len);
+    if (w > 0) {
+        fs_write(fd, "\n", 1);
+        w++;
+    }
+    fs_close(fd);
+
+    if (w < 0) kprintf("Error write: %d\n", w);
+    else       kprintf("Anadidos %d bytes a %s\n", w, name);
 }
 
 static void cmd_read(const char *args) {
@@ -280,11 +362,280 @@ static void cmd_read(const char *args) {
     screen_write("\n");
 }
 
+static void cmd_cat(const char *args) {
+    if (args[0] == 0) { screen_write("Uso: cat <archivo>\n"); return; }
+
+    int fd = fs_open(args);
+    if (fd < 0) { kprintf("Error: %d\n", fd); return; }
+
+    int size = fs_size(fd);
+    if (size <= 0) {
+        fs_close(fd);
+        return;
+    }
+
+    static char buf[FS_MAX_SIZE + 1];
+    int n = fs_read(fd, buf, FS_MAX_SIZE);
+    fs_close(fd);
+
+    buf[n] = 0;
+    screen_write(buf);
+    screen_write("\n");
+}
+
+static void cmd_cp(const char *args) {
+    char src[64], dst[64];
+    if (parse_args(args, src, dst, 64, 64) < 2) {
+        screen_write("Uso: cp <origen> <destino>\n");
+        return;
+    }
+
+    // Abrir origen
+    int fd_src = fs_open(src);
+    if (fd_src < 0) { kprintf("Error abriendo %s: %d\n", src, fd_src); return; }
+
+    int size = fs_size(fd_src);
+    if (size <= 0) {
+        kprintf("%s (vacio)\n", src);
+        fs_close(fd_src);
+        return;
+    }
+
+    // Leer todo
+    static char buf[FS_MAX_SIZE + 1];
+    int n = fs_read(fd_src, buf, FS_MAX_SIZE);
+    fs_close(fd_src);
+
+    // Crear destino
+    int fd_dst = fs_create(dst);
+    if (fd_dst < 0) { kprintf("Error creando %s: %d\n", dst, fd_dst); return; }
+
+    int w = fs_write(fd_dst, buf, n);
+    fs_close(fd_dst);
+
+    if (w < 0) kprintf("Error escribiendo: %d\n", w);
+    else       kprintf("Copiados %d bytes de %s a %s\n", w, src, dst);
+}
+
+static void cmd_mv(const char *args) {
+    char src[64], dst[64];
+    if (parse_args(args, src, dst, 64, 64) < 2) {
+        screen_write("Uso: mv <origen> <destino>\n");
+        return;
+    }
+
+    // Abrir origen
+    int fd_src = fs_open(src);
+    if (fd_src < 0) { kprintf("Error abriendo %s: %d\n", src, fd_src); return; }
+
+    int size = fs_size(fd_src);
+    if (size <= 0) {
+        kprintf("%s (vacio)\n", src);
+        fs_close(fd_src);
+        return;
+    }
+
+    // Leer todo
+    static char buf[FS_MAX_SIZE + 1];
+    int n = fs_read(fd_src, buf, FS_MAX_SIZE);
+    fs_close(fd_src);
+
+    // Crear destino
+    int fd_dst = fs_create(dst);
+    if (fd_dst < 0) { kprintf("Error creando %s: %d\n", dst, fd_dst); return; }
+
+    fs_write(fd_dst, buf, n);
+    fs_close(fd_dst);
+
+    // Borrar origen
+    fs_delete(src);
+
+    kprintf("Renombrado %s a %s (%d bytes)\n", src, dst, n);
+}
+
 static void cmd_rm(const char *args) {
     if (args[0] == 0) { screen_write("Uso: rm <archivo>\n"); return; }
     int r = fs_delete(args);
     if (r < 0) kprintf("Error: %d\n", r);
     else       kprintf("Borrado: %s\n", args);
+}
+
+static void cmd_wc(const char *args) {
+    if (args[0] == 0) { screen_write("Uso: wc <archivo>\n"); return; }
+
+    int fd = fs_open(args);
+    if (fd < 0) { kprintf("Error: %d\n", fd); return; }
+
+    int size = fs_size(fd);
+    if (size <= 0) {
+        kprintf("0 0 0 %s\n", args);
+        fs_close(fd);
+        return;
+    }
+
+    static char buf[FS_MAX_SIZE + 1];
+    int n = fs_read(fd, buf, FS_MAX_SIZE);
+    fs_close(fd);
+    buf[n] = 0;
+
+    int lines = 0, words = 0, in_word = 0;
+    for (int i = 0; i < n; i++) {
+        char c = buf[i];
+        if (c == '\n') lines++;
+        if (c == ' ' || c == '\t' || c == '\n' || c == '\r') {
+            in_word = 0;
+        } else {
+            if (!in_word) {
+                words++;
+                in_word = 1;
+            }
+        }
+    }
+
+    kprintf("%d %d %d %s\n", lines, words, n, args);
+}
+
+static void cmd_stat(const char *args) {
+    if (args[0] == 0) { screen_write("Uso: stat <archivo>\n"); return; }
+
+    int fd = fs_open(args);
+    if (fd < 0) { kprintf("Error: %d\n", fd); return; }
+
+    int size = fs_size(fd);
+    fs_close(fd);
+
+    kprintf("Archivo: %s\n", args);
+    kprintf("  Tamano:  %d bytes\n", size);
+    kprintf("  fd:      %d\n", fd);
+}
+
+static void cmd_find(const char *args) {
+    if (args[0] == 0) { screen_write("Uso: find <texto>\n"); return; }
+
+    // Recorrer todos los archivos del FS buscando el texto
+    // Como no tenemos acceso directo, iteramos sobre nombres
+    // Pero fs_list no expone nombres individuales.
+    // Solucion: usar fs_open con nombres conocidos no sirve.
+    // Necesitamos exponer una funcion en fs.h para iterar.
+
+    // Por ahora, mensaje
+    screen_write("find: pendiente de implementar iteracion del FS\n");
+}
+
+static void cmd_grep(const char *args) {
+    char pattern[64], filename[64];
+    if (parse_args(args, pattern, filename, 64, 64) < 2) {
+        screen_write("Uso: grep <texto> <archivo>\n");
+        return;
+    }
+
+    int fd = fs_open(filename);
+    if (fd < 0) { kprintf("Error: %d\n", fd); return; }
+
+    int size = fs_size(fd);
+    if (size <= 0) { fs_close(fd); return; }
+
+    static char buf[FS_MAX_SIZE + 1];
+    int n = fs_read(fd, buf, FS_MAX_SIZE);
+    fs_close(fd);
+    buf[n] = 0;
+
+    // Buscar pattern en buf
+    int plen = str_len(pattern);
+    int found = 0;
+
+    for (int i = 0; i <= n - plen; i++) {
+        int match = 1;
+        for (int j = 0; j < plen; j++) {
+            if (buf[i + j] != pattern[j]) { match = 0; break; }
+        }
+        if (match) {
+            // Mostrar la linea completa
+            int start = i;
+            while (start > 0 && buf[start - 1] != '\n') start--;
+            int end = i;
+            while (end < n && buf[end] != '\n') end++;
+
+            for (int k = start; k < end; k++) screen_putchar(buf[k]);
+            screen_write("\n");
+            found = 1;
+            i = end;
+        }
+    }
+
+    if (!found) kprintf("(sin coincidencias en %s)\n", filename);
+}
+
+static void cmd_head(const char *args) {
+    char filename[64], numstr[16];
+    if (parse_args(args, filename, numstr, 64, 16) < 2) {
+        screen_write("Uso: head <archivo> <n>\n");
+        return;
+    }
+
+    int n_lines = 0;
+    for (int i = 0; numstr[i] >= '0' && numstr[i] <= '9'; i++) {
+        n_lines = n_lines * 10 + (numstr[i] - '0');
+    }
+    if (n_lines <= 0) n_lines = 10;
+
+    int fd = fs_open(filename);
+    if (fd < 0) { kprintf("Error: %d\n", fd); return; }
+
+    int size = fs_size(fd);
+    if (size <= 0) { fs_close(fd); return; }
+
+    static char buf[FS_MAX_SIZE + 1];
+    int n = fs_read(fd, buf, FS_MAX_SIZE);
+    fs_close(fd);
+    buf[n] = 0;
+
+    int printed = 0;
+    for (int i = 0; i < n && printed < n_lines; i++) {
+        screen_putchar(buf[i]);
+        if (buf[i] == '\n') printed++;
+    }
+}
+
+static void cmd_tail(const char *args) {
+    char filename[64], numstr[16];
+    if (parse_args(args, filename, numstr, 64, 16) < 2) {
+        screen_write("Uso: tail <archivo> <n>\n");
+        return;
+    }
+
+    int n_lines = 0;
+    for (int i = 0; numstr[i] >= '0' && numstr[i] <= '9'; i++) {
+        n_lines = n_lines * 10 + (numstr[i] - '0');
+    }
+    if (n_lines <= 0) n_lines = 10;
+
+    int fd = fs_open(filename);
+    if (fd < 0) { kprintf("Error: %d\n", fd); return; }
+
+    int size = fs_size(fd);
+    if (size <= 0) { fs_close(fd); return; }
+
+    static char buf[FS_MAX_SIZE + 1];
+    int n = fs_read(fd, buf, FS_MAX_SIZE);
+    fs_close(fd);
+    buf[n] = 0;
+
+    // Contar lineas totales
+    int total_lines = 0;
+    for (int i = 0; i < n; i++) if (buf[i] == '\n') total_lines++;
+
+    // Encontrar desde donde imprimir
+    int skip = total_lines - n_lines;
+    if (skip < 0) skip = 0;
+
+    int current = 0;
+    int started = 0;
+    for (int i = 0; i < n; i++) {
+        if (!started && current >= skip) started = 1;
+        if (started) screen_putchar(buf[i]);
+        if (buf[i] == '\n') current++;
+    }
 }
 
 // =====================================================================
@@ -359,9 +710,6 @@ static void cmd_diskread(const char *args) {
     }
 }
 
-// =====================================================================
-// DISCO: escribir un sector
-// =====================================================================
 static void cmd_diskwrite(const char *args) {
     if (!ahci_is_ready()) {
         screen_write("AHCI no disponible\n");
@@ -373,7 +721,6 @@ static void cmd_diskwrite(const char *args) {
         return;
     }
 
-    // Parsear LBA decimal
     uint32_t lba = 0;
     int i = 0;
     while (args[i] >= '0' && args[i] <= '9') {
@@ -384,11 +731,9 @@ static void cmd_diskwrite(const char *args) {
 
     const char *text = args + i;
 
-    // Preparar sector con ceros
     static unsigned char buf[512];
     for (int k = 0; k < 512; k++) buf[k] = 0;
 
-    // Copiar el texto (maximo 511 bytes)
     int len = 0;
     while (text[len] && len < 511) {
         buf[len] = text[len];
@@ -437,16 +782,28 @@ static void execute(const char *l) {
     else if (str_eq(l, "cpuid"))        cmd_cpuid();
     else if (str_eq(l, "mem"))          cmd_mem();
     else if (str_eq(l, "heap"))         cmd_heap();
+    else if (str_eq(l, "free"))         cmd_free();
     else if (str_eq(l, "test"))         cmd_test();
     else if (str_eq(l, "ls"))           cmd_ls();
+    else if (str_eq(l, "df"))           cmd_df();
     else if (str_eq(l, "diskinfo"))     cmd_diskinfo();
     else if (str_eq(l, "reboot"))       cmd_reboot();
     else if (str_eq(l, "shutdown"))     cmd_shutdown();
     else if (str_starts_with(l, "echo "))      cmd_echo(l + 5);
     else if (str_starts_with(l, "touch "))     cmd_touch(l + 6);
     else if (str_starts_with(l, "write "))     cmd_write(l + 6);
+    else if (str_starts_with(l, "append "))    cmd_append(l + 7);
     else if (str_starts_with(l, "read "))      cmd_read(l + 5);
+    else if (str_starts_with(l, "cat "))       cmd_cat(l + 4);
+    else if (str_starts_with(l, "cp "))        cmd_cp(l + 3);
+    else if (str_starts_with(l, "mv "))        cmd_mv(l + 3);
     else if (str_starts_with(l, "rm "))        cmd_rm(l + 3);
+    else if (str_starts_with(l, "wc "))        cmd_wc(l + 3);
+    else if (str_starts_with(l, "stat "))      cmd_stat(l + 5);
+    else if (str_starts_with(l, "find "))      cmd_find(l + 5);
+    else if (str_starts_with(l, "grep "))      cmd_grep(l + 5);
+    else if (str_starts_with(l, "head "))      cmd_head(l + 5);
+    else if (str_starts_with(l, "tail "))      cmd_tail(l + 5);
     else if (str_starts_with(l, "diskread "))  cmd_diskread(l + 9);
     else if (str_starts_with(l, "diskwrite ")) cmd_diskwrite(l + 10);
     else if (l[0] == 0) { /* linea vacia */ }
