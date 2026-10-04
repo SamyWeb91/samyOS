@@ -12,19 +12,27 @@
 #include "thread.h"
 
 // =====================================================================
-// Workers: trabajo ligero + yield
+// Workers
+//
+// worker1: sin yield → el timer debe expulsarlo.
+// worker2: con yield → cooperativo.
+//
+// Si el teclado responde con worker1 (sin yield), el scheduler es
+// expulsivo. Si solo responde con worker2 (con yield), es cooperativo.
 // =====================================================================
 void worker1(void) {
+    volatile unsigned int x = 0;
     while (1) {
-        for (volatile int i = 0; i < 1000; i++) {}
-        thread_yield();
+        x++;
+        // SIN yield → el timer debe expulsar
     }
 }
 
 void worker2(void) {
+    volatile unsigned int y = 0;
     while (1) {
-        for (volatile int i = 0; i < 1000; i++) {}
-        thread_yield();
+        y++;
+        // SIN yield también, para la prueba
     }
 }
 
@@ -33,8 +41,8 @@ void worker2(void) {
 // =====================================================================
 extern "C" void kernel_main(void) {
     screen_clear();
-    kprintf("MiniOS - AHCI + FS + Threads\n");
-    kprintf("============================\n\n");
+    kprintf("MiniOS - AHCI + FS + Threads (expulsivo)\n");
+    kprintf("=========================================\n\n");
 
     idt_init();
     kprintf("IDT cargada\n");
