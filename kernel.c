@@ -9,11 +9,32 @@
 #include "paging.h"
 #include "fs.h"
 #include "ahci.h"
+#include "thread.h"
 
+// =====================================================================
+// Workers: trabajo ligero + yield
+// =====================================================================
+void worker1(void) {
+    while (1) {
+        for (volatile int i = 0; i < 1000; i++) {}
+        thread_yield();
+    }
+}
+
+void worker2(void) {
+    while (1) {
+        for (volatile int i = 0; i < 1000; i++) {}
+        thread_yield();
+    }
+}
+
+// =====================================================================
+// kernel_main
+// =====================================================================
 extern "C" void kernel_main(void) {
     screen_clear();
-    kprintf("MiniOS - AHCI + FS\n");
-    kprintf("==================\n\n");
+    kprintf("MiniOS - AHCI + FS + Threads\n");
+    kprintf("============================\n\n");
 
     idt_init();
     kprintf("IDT cargada\n");
@@ -34,12 +55,9 @@ extern "C" void kernel_main(void) {
     paging_enable_now();
     kprintf("Paginacion activada\n");
 
-    // Mapear la zona MMIO del chipset (para AHCI)
     paging_map_range(0xFE000000, 0xFE000000, 32768, PTE_PRESENT | PTE_RW);
     kprintf("MMIO mapeado (0xFE000000 - 0xFFFFFFFF)\n");
 
-    // AHCI debe inicializarse ANTES que el FS,
-    // porque fs_init() lee del disco vía AHCI.
     kprintf("\n");
     if (ahci_init()) {
         kprintf("AHCI listo\n");
@@ -47,8 +65,15 @@ extern "C" void kernel_main(void) {
         kprintf("AHCI no disponible\n");
     }
 
-    // Ahora sí, el FS puede leer/escribir en disco.
     fs_init();
+
+    kprintf("\n");
+    thread_init();
+
+    thread_create("worker1", worker1);
+    thread_create("worker2", worker2);
+
+    kprintf("Threads listos\n");
 
     asm volatile("sti");
 

@@ -7,6 +7,7 @@
 #include "rtc.h"
 #include "fs.h"
 #include "ahci.h"
+#include "thread.h"
 
 #define LINE_MAX 128
 
@@ -70,6 +71,8 @@ static void cmd_help() {
     screen_write("  diskinfo      - info del disco SATA\n");
     screen_write("  diskread <lba> - leer sector del disco\n");
     screen_write("  diskwrite <lba> <txt> - escribir sector\n");
+    screen_write("  ps            - listar procesos\n");
+    screen_write("  kill <pid>    - terminar proceso\n");
     screen_write("  reboot        - reiniciar el PC\n");
     screen_write("  shutdown      - apagar el PC\n");
 }
@@ -108,7 +111,7 @@ static int parse_args(const char *args, char *a1, char *a2, int a1max, int a2max
     }
     a1[i] = 0;
 
-    if (args[i] == 0) return 1;   // solo 1 argumento
+    if (args[i] == 0) return 1;
     i++;
     int j = 0;
     while (args[i] && j < a2max - 1) {
@@ -644,7 +647,6 @@ static void cmd_diskread(const char *args) {
         return;
     }
 
-    // Validar que empiece con digito
     if (args[0] < '0' || args[0] > '9') {
         screen_write("Error: <lba> debe ser un numero\n");
         screen_write("Uso: diskread <lba>\n");
@@ -704,7 +706,6 @@ static void cmd_diskwrite(const char *args) {
         return;
     }
 
-    // Validar que empiece con digito
     if (args[0] < '0' || args[0] > '9') {
         screen_write("Error: <lba> debe ser un numero\n");
         screen_write("Uso: diskwrite <lba> <texto>\n");
@@ -737,6 +738,31 @@ static void cmd_diskwrite(const char *args) {
     }
 
     kprintf("Escritos %d bytes en sector %u\n", len, lba);
+}
+
+// =====================================================================
+// THREADS
+// =====================================================================
+static void cmd_ps() {
+    thread_list();
+}
+
+static void cmd_kill(const char *args) {
+    if (args[0] == 0) {
+        screen_write("Uso: kill <pid>\n");
+        return;
+    }
+    int pid = 0;
+    for (int i = 0; args[i] >= '0' && args[i] <= '9'; i++) {
+        pid = pid * 10 + (args[i] - '0');
+    }
+    if (pid <= 0) {
+        screen_write("PID invalido\n");
+        return;
+    }
+    int r = thread_kill(pid);
+    if (r < 0) kprintf("No se pudo matar PID %d\n", pid);
+    else       kprintf("PID %d terminado\n", pid);
 }
 
 // =====================================================================
@@ -777,6 +803,8 @@ static void execute(const char *l) {
     else if (str_eq(l, "ls"))           cmd_ls();
     else if (str_eq(l, "df"))           cmd_df();
     else if (str_eq(l, "diskinfo"))     cmd_diskinfo();
+    else if (str_eq(l, "ps"))           cmd_ps();
+    else if (str_eq(l, "threads"))      cmd_ps();
     else if (str_eq(l, "reboot"))       cmd_reboot();
     else if (str_eq(l, "shutdown"))     cmd_shutdown();
     else if (str_starts_with(l, "echo "))      cmd_echo(l + 5);
@@ -796,6 +824,7 @@ static void execute(const char *l) {
     else if (str_starts_with(l, "tail "))      cmd_tail(l + 5);
     else if (str_starts_with(l, "diskread "))  cmd_diskread(l + 9);
     else if (str_starts_with(l, "diskwrite ")) cmd_diskwrite(l + 10);
+    else if (str_starts_with(l, "kill "))      cmd_kill(l + 5);
     else if (l[0] == 0) { /* linea vacia */ }
     else kprintf("Comando desconocido: %s\n", l);
 }
@@ -809,7 +838,10 @@ void shell_run() {
 
     while (1) {
         char c = keyboard_getchar();
-        if (!c) continue;
+        if (!c) {
+            thread_yield();     // ← ceder CPU mientras no hay tecla
+            continue;
+        }
 
         if (c == '\n') {
             screen_putchar('\n');
