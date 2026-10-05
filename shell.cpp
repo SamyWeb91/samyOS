@@ -74,7 +74,9 @@ static void cmd_help() {
     screen_write("  diskinfo      - info del disco SATA\n");
     screen_write("  diskread <lba> - leer sector del disco\n");
     screen_write("  diskwrite <lba> <txt> - escribir sector\n");
-    screen_write("  ring3         - lanzar proceso en ring 3\n");
+    screen_write("  load <n> <lba> - copiar 4 KB del LBA al FS como <n>\n");
+    screen_write("  run <archivo> - ejecutar archivo del FS en ring 3\n");
+    screen_write("  ring3         - lanzar proceso de prueba en ring 3\n");
     screen_write("  ps            - listar procesos\n");
     screen_write("  kill <pid>    - terminar proceso\n");
     screen_write("  reboot        - reiniciar el PC\n");
@@ -138,12 +140,7 @@ static void cmd_tssinfo() {
 // thread_exit() mata ESE hilo (no kmain). La shell sigue viva.
 // =====================================================================
 static void ring3_task(void) {
-    // Corremos en ring 0, en un hilo propio.
-    // user_start() hace el iret a ring 3.
-    // El user hace write+exit. exit mata este hilo.
     user_start();
-
-    // Si user_start() retorna (no debería), matamos el hilo.
     while (1) {
         thread_yield();
     }
@@ -157,8 +154,6 @@ static void cmd_ring3() {
         return;
     }
     kprintf("Proceso ring3 creado (PID=%d)\n", tid);
-    // La shell NO espera. El scheduler correrá ring3_task.
-    // Cuando el user haga exit, el hilo muere y volvemos aquí.
 }
 
 // =====================================================================
@@ -802,6 +797,115 @@ static void cmd_diskwrite(const char *args) {
 }
 
 // =====================================================================
+// LOAD: copiar bytes del disco (LBA) a un archivo del FS
+// Uso: load <nombre> <lba>
+// =====================================================================
+static void cmd_load(const char *args) {
+    char name[64], lbastr[16];
+    if (parse_args(args, name, lbastr, 64, 16) < 2) {
+        screen_write("Uso: load <nombre> <lba>\n");
+        screen_write("  Copia 4 KB desde el LBA al archivo indicado.\n");
+        return;
+    }
+
+    if (!ahci_is_ready()) {
+        screen_write("load: AHCI no disponible\n");
+        return;
+    }
+
+    // Parsear LBA
+    uint32_t lba = 0;
+    for (int i = 0; lbastr[i] >= '0' && lbastr[i] <= '9'; i++) {
+        lba = lba * 10 + (lbastr[i] - '0');
+    }
+
+    // Leer 8 sectores (4 KB)
+    static uint8_t buf[4096];
+    for (uint32_t s = 0; s < 8; s++) {
+        if (!ahci_read_sector(lba + s, buf + s * 512)) {
+            kprintf("load: error leyendo sector %u\n", lba + s);
+            return;
+        }
+    }
+
+    // Crear archivo en el FS (si ya existe, borrarlo y recrear)
+    int fd = fs_open(name);
+    if (fd >= 0) {
+        fs_close(fd);
+        fs_delete(name);
+    }
+
+    fd = fs_create(name);
+    if (fd < 0) {
+        kprintf("load: error creando %s: %d\n", name, fd);
+        return;
+    }
+
+    // Escribir los 4 KB
+    int w = fs_write(fd, buf, 4096);
+    fs_close(fd);
+
+    if (w < 0) kprintf("load: error escribiendo: %d\n", w);
+    else       kprintf("load: %s creado (%d bytes desde LBA %u)\n",
+                       name, w, lba);
+}
+
+// =====================================================================
+// RUN: ejecutar archivo del FS en ring 3
+// Uso: run <archivo>
+// =====================================================================
+static volatile uint32_t g_run_size = 0;
+static uint8_t g_run_buf[4096];
+
+static void run_task(void) {
+    user_run_buffer(g_run_buf, g_run_size);
+    while (1) {
+        thread_yield();
+    }
+}
+
+static void cmd_run(const char *args) {
+    if (args[0] == 0) {
+        screen_write("Uso: run <archivo>\n");
+        return;
+    }
+
+    // Abrir archivo
+    int fd = fs_open(args);
+    if (fd < 0) {
+        kprintf("run: no existe '%s' (%d)\n", args, fd);
+        return;
+    }
+
+    int size = fs_size(fd);
+    if (size <= 0 || size > 4096) {
+        kprintf("run: tamaño invalido (%d)\n", size);
+        fs_close(fd);
+        return;
+    }
+
+    // Leer bytes al buffer global
+    int n = fs_read(fd, g_run_buf, 4096);
+    fs_close(fd);
+
+    if (n <= 0) {
+        screen_write("run: error leyendo\n");
+        return;
+    }
+
+    g_run_size = (uint32_t)n;
+
+    // Crear hilo para ejecutar en ring 3
+    int tid = thread_create("run", run_task);
+    if (tid < 0) {
+        screen_write("run: no se pudo crear el hilo\n");
+        return;
+    }
+
+    kprintf("run: '%s' (%d bytes) -> PID=%d\n", args, n, tid);
+}
+
+// =====================================================================
 // THREADS
 // =====================================================================
 static void cmd_ps() {
@@ -887,6 +991,8 @@ static void execute(const char *l) {
     else if (str_starts_with(l, "tail "))      cmd_tail(l + 5);
     else if (str_starts_with(l, "diskread "))  cmd_diskread(l + 9);
     else if (str_starts_with(l, "diskwrite ")) cmd_diskwrite(l + 10);
+    else if (str_starts_with(l, "load "))      cmd_load(l + 5);
+    else if (str_starts_with(l, "run "))       cmd_run(l + 4);
     else if (str_starts_with(l, "kill "))      cmd_kill(l + 5);
     else if (l[0] == 0) { /* linea vacia */ }
     else kprintf("Comando desconocido: %s\n", l);

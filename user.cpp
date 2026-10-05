@@ -6,11 +6,14 @@
 // - Copia el blob del programa (user_prog_blob.o) a 0x400000.
 // - Copia el mensaje a 0x400800.
 // - Provee user_start() para entrar a ring 3.
+// - Provee user_run_buffer() para ejecutar un buffer arbitrario.
+// - Provee user_load_and_run() para ejecutar un binario del disco.
 // =====================================================================
 
 #include "user.h"
 #include "screen.h"
 #include "paging.h"
+#include "ahci.h"
 
 // Simbolos exportados por user_prog_blob.o (via objcopy)
 extern "C" uint8_t user_prog_start[];
@@ -25,7 +28,7 @@ extern "C" void enter_user_mode(uint32_t entry, uint32_t user_stack);
 // Mapear el espacio del usuario y copiar el blob
 // =====================================================================
 extern "C" void user_init(void) {
-    paging_map_range(0x400000, 0x400000, 32,
+    paging_map_range(USER_CODE_VADDR, USER_CODE_VADDR, 32,
                      PTE_PRESENT | PTE_RW | PTE_USER);
 
     kprintf("User: mapeado 0x400000 - 0x408000 (PTE_USER)\n");
@@ -48,7 +51,7 @@ extern "C" void user_init(void) {
 }
 
 // =====================================================================
-// Entrar en ring 3
+// Entrar en ring 3 (usando el blob del kernel)
 // =====================================================================
 extern "C" void user_start(void) {
     uint32_t user_stack_top = USER_STACK_VADDR + USER_STACK_SIZE;
@@ -66,4 +69,61 @@ extern "C" void user_start(void) {
 // =====================================================================
 extern "C" uint32_t user_get_kernel_stack(void) {
     return (uint32_t)user_kernel_stack + sizeof(user_kernel_stack);
+}
+
+// =====================================================================
+// Ejecutar un buffer en ring 3.
+//
+// Copia el buffer a 0x400000 (que ya está mapeado con PTE_USER)
+// y hace el iret a ring 3. Retorna cuando el binario hace exit().
+// =====================================================================
+extern "C" int user_run_buffer(const void *buf, uint32_t size) {
+    if (!buf || size == 0 || size > USER_PROG_MAX) {
+        kprintf("run: buffer invalido (size=%u)\n", size);
+        return -1;
+    }
+
+    // Asegurar que el espacio está mapeado con PTE_USER
+    // (por si acaso se llamó sin user_init)
+    paging_map_range(USER_CODE_VADDR, USER_CODE_VADDR, 32,
+                     PTE_PRESENT | PTE_RW | PTE_USER);
+
+    // Copiar el buffer a 0x400000
+    uint8_t *dst = (uint8_t *)USER_CODE_VADDR;
+    const uint8_t *src = (const uint8_t *)buf;
+    for (uint32_t i = 0; i < size; i++) {
+        dst[i] = src[i];
+    }
+
+    // Ejecutar en ring 3
+    uint32_t user_stack_top = USER_STACK_VADDR + USER_STACK_SIZE;
+
+    kprintf("run: ejecutando %u bytes en 0x%x\n", size, USER_CODE_VADDR);
+
+    enter_user_mode(USER_CODE_VADDR, user_stack_top);
+
+    kprintf("run: binario terminado\n");
+    return 0;
+}
+
+// =====================================================================
+// Leer 4 KB desde un LBA y ejecutarlos en ring 3.
+// =====================================================================
+extern "C" int user_load_and_run(uint32_t lba) {
+    if (!ahci_is_ready()) {
+        kprintf("run: AHCI no disponible\n");
+        return -1;
+    }
+
+    static uint8_t buf[USER_PROG_MAX];
+
+    // Leer 8 sectores (4 KB) desde el LBA indicado
+    for (uint32_t s = 0; s < USER_PROG_MAX / 512; s++) {
+        if (!ahci_read_sector(lba + s, buf + s * 512)) {
+            kprintf("run: error leyendo sector %u\n", lba + s);
+            return -1;
+        }
+    }
+
+    return user_run_buffer(buf, USER_PROG_MAX);
 }
