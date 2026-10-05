@@ -59,8 +59,10 @@ extern "C" void irq_15();
 
 // =====================================================================
 // Configurar una entrada de la IDT
+//
+// No-static: syscall.cpp la llama para registrar int 0x80.
 // =====================================================================
-static void idt_set_gate(int n, unsigned int base, unsigned short sel, unsigned char flags) {
+void idt_set_gate(int n, unsigned int base, unsigned short sel, unsigned char flags) {
     idt[n].base_lo = base & 0xFFFF;
     idt[n].base_hi = (base >> 16) & 0xFFFF;
     idt[n].sel = sel;

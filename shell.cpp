@@ -9,6 +9,7 @@
 #include "ahci.h"
 #include "thread.h"
 #include "tss.h"
+#include "user.h"
 
 #define LINE_MAX 128
 
@@ -73,6 +74,7 @@ static void cmd_help() {
     screen_write("  diskinfo      - info del disco SATA\n");
     screen_write("  diskread <lba> - leer sector del disco\n");
     screen_write("  diskwrite <lba> <txt> - escribir sector\n");
+    screen_write("  ring3         - entrar a ring 3 (proceso usuario)\n");
     screen_write("  ps            - listar procesos\n");
     screen_write("  kill <pid>    - terminar proceso\n");
     screen_write("  reboot        - reiniciar el PC\n");
@@ -106,17 +108,12 @@ static void cmd_echo(const char *args) {
 // TSS info
 // =====================================================================
 static void cmd_tssinfo() {
-    // Leer el registro TR (Task Register) con la instrucción 'str'.
-    // Si el TSS está cargado, TR debe ser 0x28 (índice 5, RPL=0).
-    // Si TR = 0, el 'ltr' falló y el TSS no está activo.
     uint16_t tr;
     asm volatile("str %0" : "=r"(tr));
 
-    // Leer el registro CR3 (page directory actual).
     uint32_t cr3;
     asm volatile("mov %%cr3, %0" : "=r"(cr3));
 
-    // Leer CS y SS actuales (para verificar el ring en el que estamos).
     uint16_t cs, ss;
     asm volatile("mov %%cs, %0" : "=r"(cs));
     asm volatile("mov %%ss, %0" : "=r"(ss));
@@ -132,6 +129,15 @@ static void cmd_tssinfo() {
     kprintf("  CS    = %x (ring %u)\n", cs, cs & 3);
     kprintf("  SS    = %x (ring %u)\n", ss, ss & 3);
     kprintf("  CR3   = %x\n", cr3);
+}
+
+// =====================================================================
+// Ring 3
+// =====================================================================
+static void cmd_ring3() {
+    kprintf("Entrando a ring 3...\n");
+    user_start();
+    kprintf("Volvimos de ring 3\n");
 }
 
 // =====================================================================
@@ -835,6 +841,7 @@ static void execute(const char *l) {
     else if (str_eq(l, "free"))         cmd_free();
     else if (str_eq(l, "test"))         cmd_test();
     else if (str_eq(l, "tssinfo"))      cmd_tssinfo();
+    else if (str_eq(l, "ring3"))        cmd_ring3();
     else if (str_eq(l, "ls"))           cmd_ls();
     else if (str_eq(l, "df"))           cmd_df();
     else if (str_eq(l, "diskinfo"))     cmd_diskinfo();

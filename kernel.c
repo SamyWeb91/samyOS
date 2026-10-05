@@ -12,6 +12,8 @@
 #include "fs.h"
 #include "ahci.h"
 #include "thread.h"
+#include "syscall.h"
+#include "user.h"
 
 // =====================================================================
 // Workers
@@ -40,20 +42,18 @@ void worker2(void) {
 // =====================================================================
 extern "C" void kernel_main(void) {
     screen_clear();
-    kprintf("MiniOS - AHCI + FS + Threads (expulsivo)\n");
-    kprintf("=========================================\n\n");
+    kprintf("MiniOS - AHCI + FS + Threads + Ring3\n");
+    kprintf("=====================================\n\n");
 
     idt_init();
     kprintf("IDT cargada\n");
 
     // GDT propia del kernel: 6 entradas (null, kcode, kdata,
-    // ucode, udata, TSS). Reemplaza la GDT del bootloader que
-    // solo tenía 3 entradas.
+    // ucode, udata, TSS).
     gdt_init();
     kprintf("GDT recargada\n");
 
     // TSS: necesario para ring 3 (cambio de stack user→kernel).
-    // Se registra como descriptor 0x28 en la GDT.
     tss_init();
     kprintf("TSS cargado\n");
 
@@ -76,6 +76,21 @@ extern "C" void kernel_main(void) {
     paging_map_range(0xFE000000, 0xFE000000, 32768, PTE_PRESENT | PTE_RW);
     kprintf("MMIO mapeado (0xFE000000 - 0xFFFFFFFF)\n");
 
+    // =============================================================
+    // Syscalls: registrar int 0x80 en la IDT (DPL=3)
+    // =============================================================
+    kprintf("\n");
+    syscall_init();
+
+    // =============================================================
+    // Ring 3: mapear el espacio de usuario y copiar el blob
+    // a 0x400000. NO entra todavía, solo prepara.
+    // =============================================================
+    user_init();
+
+    // =============================================================
+    // AHCI + FS
+    // =============================================================
     kprintf("\n");
     if (ahci_init()) {
         kprintf("AHCI listo\n");
@@ -85,6 +100,9 @@ extern "C" void kernel_main(void) {
 
     fs_init();
 
+    // =============================================================
+    // Threads
+    // =============================================================
     kprintf("\n");
     thread_init();
 
