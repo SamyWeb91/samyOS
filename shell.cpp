@@ -74,7 +74,7 @@ static void cmd_help() {
     screen_write("  diskinfo      - info del disco SATA\n");
     screen_write("  diskread <lba> - leer sector del disco\n");
     screen_write("  diskwrite <lba> <txt> - escribir sector\n");
-    screen_write("  ring3         - entrar a ring 3 (proceso usuario)\n");
+    screen_write("  ring3         - lanzar proceso en ring 3\n");
     screen_write("  ps            - listar procesos\n");
     screen_write("  kill <pid>    - terminar proceso\n");
     screen_write("  reboot        - reiniciar el PC\n");
@@ -133,11 +133,32 @@ static void cmd_tssinfo() {
 
 // =====================================================================
 // Ring 3
+//
+// ring3_task corre en un hilo nuevo. Cuando el user hace exit,
+// thread_exit() mata ESE hilo (no kmain). La shell sigue viva.
 // =====================================================================
-static void cmd_ring3() {
-    kprintf("Entrando a ring 3...\n");
+static void ring3_task(void) {
+    // Corremos en ring 0, en un hilo propio.
+    // user_start() hace el iret a ring 3.
+    // El user hace write+exit. exit mata este hilo.
     user_start();
-    kprintf("Volvimos de ring 3\n");
+
+    // Si user_start() retorna (no debería), matamos el hilo.
+    while (1) {
+        thread_yield();
+    }
+}
+
+static void cmd_ring3() {
+    kprintf("Creando proceso en ring 3...\n");
+    int tid = thread_create("ring3", ring3_task);
+    if (tid < 0) {
+        kprintf("Error: no se pudo crear el hilo\n");
+        return;
+    }
+    kprintf("Proceso ring3 creado (PID=%d)\n", tid);
+    // La shell NO espera. El scheduler correrá ring3_task.
+    // Cuando el user haga exit, el hilo muere y volvemos aquí.
 }
 
 // =====================================================================
