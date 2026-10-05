@@ -8,6 +8,7 @@
 #include "fs.h"
 #include "ahci.h"
 #include "thread.h"
+#include "tss.h"
 
 #define LINE_MAX 128
 
@@ -52,6 +53,7 @@ static void cmd_help() {
     screen_write("  heap          - estadisticas del heap\n");
     screen_write("  free          - memoria libre\n");
     screen_write("  test          - prueba de kmalloc/kfree\n");
+    screen_write("  tssinfo       - info del TSS\n");
     screen_write("  ls            - listar archivos\n");
     screen_write("  df            - espacio del FS\n");
     screen_write("  touch <name>  - crear archivo\n");
@@ -98,6 +100,38 @@ static void cmd_date() {
 static void cmd_echo(const char *args) {
     screen_write(args);
     screen_write("\n");
+}
+
+// =====================================================================
+// TSS info
+// =====================================================================
+static void cmd_tssinfo() {
+    // Leer el registro TR (Task Register) con la instrucción 'str'.
+    // Si el TSS está cargado, TR debe ser 0x28 (índice 5, RPL=0).
+    // Si TR = 0, el 'ltr' falló y el TSS no está activo.
+    uint16_t tr;
+    asm volatile("str %0" : "=r"(tr));
+
+    // Leer el registro CR3 (page directory actual).
+    uint32_t cr3;
+    asm volatile("mov %%cr3, %0" : "=r"(cr3));
+
+    // Leer CS y SS actuales (para verificar el ring en el que estamos).
+    uint16_t cs, ss;
+    asm volatile("mov %%cs, %0" : "=r"(cs));
+    asm volatile("mov %%ss, %0" : "=r"(ss));
+
+    kprintf("TSS:\n");
+    kprintf("  TR    = %x (esperado 0x28)\n", tr);
+    kprintf("  base  = %x\n", tss_get_base());
+    kprintf("  limit = %u\n",  tss_get_limit());
+    kprintf("  ss0   = %x\n", tss_get_ss0());
+    kprintf("  esp0  = %x\n", tss_get_esp0());
+    kprintf("\n");
+    kprintf("CPU:\n");
+    kprintf("  CS    = %x (ring %u)\n", cs, cs & 3);
+    kprintf("  SS    = %x (ring %u)\n", ss, ss & 3);
+    kprintf("  CR3   = %x\n", cr3);
 }
 
 // =====================================================================
@@ -800,6 +834,7 @@ static void execute(const char *l) {
     else if (str_eq(l, "heap"))         cmd_heap();
     else if (str_eq(l, "free"))         cmd_free();
     else if (str_eq(l, "test"))         cmd_test();
+    else if (str_eq(l, "tssinfo"))      cmd_tssinfo();
     else if (str_eq(l, "ls"))           cmd_ls();
     else if (str_eq(l, "df"))           cmd_df();
     else if (str_eq(l, "diskinfo"))     cmd_diskinfo();
@@ -839,7 +874,7 @@ void shell_run() {
     while (1) {
         char c = keyboard_getchar();
         if (!c) {
-            thread_yield();     // ← ceder CPU mientras no hay tecla
+            thread_yield();     // ceder CPU mientras no hay tecla
             continue;
         }
 

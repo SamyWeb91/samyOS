@@ -7,7 +7,7 @@
 #include <stdint.h>
 #include "screen.h"
 #include "io.h"
-
+#include "paging.h"
 #define PCI_CONFIG_ADDRESS  0xCF8
 #define PCI_CONFIG_DATA     0xCFC
 
@@ -183,14 +183,48 @@ static int ahci_enable_pci()
     }
     return 1;
 }
+//he modificado esta parte
 
 static HBA_MEM *ahci_get_abar()
 {
     uint32_t bar5 = pci_read32(ahci_pci_bus, ahci_pci_dev, ahci_pci_func, 0x24);
-    if (bar5 & 1) { kprintf("AHCI: BAR5 es I/O\n"); return 0; }
+
+    // bit 0 = 1 → BAR de I/O, no MMIO
+    if (bar5 & 1) {
+        kprintf("AHCI: BAR5 es I/O, no MMIO\n");
+        return 0;
+    }
+
     uint32_t abar = bar5 & 0xFFFFFFF0U;
-    if (!abar) { kprintf("AHCI: ABAR = 0\n"); return 0; }
+
+    if (!abar) {
+        kprintf("AHCI: ABAR = 0\n");
+        return 0;
+    }
+
     kprintf("AHCI: ABAR = %x\n", abar);
+
+    // >>> FIX: mapear dinámicamente el ABAR en el espacio virtual.
+    //
+    // En QEMU, el ABAR suele estar en 0xFEBD5000 (dentro del rango
+    // MMIO clásico 0xFE000000-0xFFFFFFFF que el kernel mapea al
+    // arranque). Pero en hardware real (ej. Intel Sunrise Point-LP,
+    // device 0x9D03), el ABAR puede estar en 0xF124C000, FUERA de
+    // ese rango. Sin mapearlo, el primer acceso provoca Page Fault.
+    //
+    // Mapeamos 32 KB desde el ABAR (más que suficiente para los
+    // registros AHCI: HBA_MEM ocupa ~0x1100 bytes + ports).
+    //
+    // paging_map_range(virt, phys, size_kb, flags):
+    //   - Como estamos en identity mapping, virt == phys.
+    //   - size_kb = 32 → mapea 32 páginas de 4 KB = 128 KB.
+    //
+    // Nota: si el ABAR cruza un límite de 4 MB, paging_map() crea
+    // automáticamente una nueva page table en pt_pool.
+    paging_map_range(abar, abar, 32, PTE_PRESENT | PTE_RW);
+
+    kprintf("AHCI: ABAR mapeado (%u KB)\n", 32);
+
     return (HBA_MEM *)abar;
 }
 

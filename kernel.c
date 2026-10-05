@@ -1,5 +1,7 @@
 #include "screen.h"
 #include "idt.h"
+#include "gdt.h"
+#include "tss.h"
 #include "pic.h"
 #include "pit.h"
 #include "keyboard.h"
@@ -15,10 +17,7 @@
 // Workers
 //
 // worker1: sin yield → el timer debe expulsarlo.
-// worker2: con yield → cooperativo.
-//
-// Si el teclado responde con worker1 (sin yield), el scheduler es
-// expulsivo. Si solo responde con worker2 (con yield), es cooperativo.
+// worker2: sin yield también, para probar expulsividad pura.
 // =====================================================================
 void worker1(void) {
     volatile unsigned int x = 0;
@@ -32,7 +31,7 @@ void worker2(void) {
     volatile unsigned int y = 0;
     while (1) {
         y++;
-        // SIN yield también, para la prueba
+        // SIN yield también
     }
 }
 
@@ -46,6 +45,17 @@ extern "C" void kernel_main(void) {
 
     idt_init();
     kprintf("IDT cargada\n");
+
+    // GDT propia del kernel: 6 entradas (null, kcode, kdata,
+    // ucode, udata, TSS). Reemplaza la GDT del bootloader que
+    // solo tenía 3 entradas.
+    gdt_init();
+    kprintf("GDT recargada\n");
+
+    // TSS: necesario para ring 3 (cambio de stack user→kernel).
+    // Se registra como descriptor 0x28 en la GDT.
+    tss_init();
+    kprintf("TSS cargado\n");
 
     pic_remap();
     kprintf("PIC remapeado\n");
