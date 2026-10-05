@@ -71,9 +71,10 @@ extern "C" int thread_create(const char *name, void (*entry)(void)) {
     if (thread_count >= THREAD_MAX || !entry)
         return -1;
 
+    // Buscar slot libre: ZOMBIE con nombre vacío (slot limpiado)
     int idx = -1;
     for (int i = 1; i < THREAD_MAX; i++) {
-        if (threads[i].state == TH_ZOMBIE) {
+        if (threads[i].state == TH_ZOMBIE && threads[i].name[0] == 0) {
             idx = i;
             break;
         }
@@ -204,6 +205,10 @@ extern "C" void thread_yield(void) {
 
 // =====================================================================
 // Exit
+//
+// Limpia COMPLETAMENTE el slot: nombre vacío, esp=0, priority=0,
+// stack_size=0. Con eso thread_list() lo ignora y thread_create()
+// puede reutilizarlo.
 // =====================================================================
 extern "C" void thread_exit(void) {
     if (current <= 0)
@@ -213,6 +218,9 @@ extern "C" void thread_exit(void) {
     threads[current].state      = TH_ZOMBIE;
     threads[current].stack_base = 0;
     threads[current].esp        = 0;
+    threads[current].stack_size = 0;
+    threads[current].priority   = 0;
+    threads[current].name[0]    = 0;    // ← LIMPIAR nombre
     thread_entries[current]     = 0;
     thread_count--;
     asm volatile("sti");
@@ -223,6 +231,8 @@ extern "C" void thread_exit(void) {
 
 // =====================================================================
 // Kill
+//
+// Igual que exit: limpia completamente el slot.
 // =====================================================================
 extern "C" int thread_kill(int id) {
     if (id <= 0 || id >= THREAD_MAX)
@@ -234,6 +244,9 @@ extern "C" int thread_kill(int id) {
     threads[id].state      = TH_ZOMBIE;
     threads[id].stack_base = 0;
     threads[id].esp        = 0;
+    threads[id].stack_size = 0;
+    threads[id].priority   = 0;
+    threads[id].name[0]    = 0;         // ← LIMPIAR nombre
     thread_entries[id]     = 0;
     thread_count--;
     asm volatile("sti");
@@ -258,17 +271,24 @@ extern "C" void thread_list(void) {
     const char *state_names[] = { "READY", "RUNNING", "BLOCKED", "ZOMBIE" };
     kprintf("PID  NOMBRE      ESTADO    PRIO  TICKS\n");
     for (int i = 0; i < THREAD_MAX; i++) {
+        // Saltar slots sin nombre (hilos terminados/limpiados)
+        if (threads[i].name[0] == 0) continue;
+
+        // Filtro adicional por seguridad
         if (threads[i].state == TH_ZOMBIE && threads[i].esp == 0)
             continue;
+
         kprintf("  %d  ", i);
         int len = 0;
         while (threads[i].name[len]) len++;
         kprintf("%s", threads[i].name);
         for (int j = len; j < 10; j++) screen_putchar(' ');
+
         kprintf("%s", state_names[threads[i].state]);
         int sl = 0;
         while (state_names[threads[i].state][sl]) sl++;
         for (int j = sl; j < 10; j++) screen_putchar(' ');
+
         kprintf("%d    %u\n", threads[i].priority, thread_ticks[i]);
     }
 }
