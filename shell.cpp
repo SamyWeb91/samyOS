@@ -10,6 +10,7 @@
 #include "thread.h"
 #include "tss.h"
 #include "user.h"
+#include "desktop.h"
 
 #define LINE_MAX 128
 
@@ -77,6 +78,7 @@ static void cmd_help() {
     screen_write("  load <n> <lba> - copiar 4 KB del LBA al FS como <n>\n");
     screen_write("  run <archivo> - ejecutar archivo del FS en ring 3\n");
     screen_write("  ring3         - lanzar proceso de prueba en ring 3\n");
+    screen_write("  desktop       - escritorio grafico simple\n");
     screen_write("  ps            - listar procesos\n");
     screen_write("  kill <pid>    - terminar proceso\n");
     screen_write("  reboot        - reiniciar el PC\n");
@@ -104,6 +106,13 @@ static void cmd_date() {
 static void cmd_echo(const char *args) {
     screen_write(args);
     screen_write("\n");
+}
+
+// =====================================================================
+// Escritorio
+// =====================================================================
+static void cmd_desktop() {
+    desktop_run();
 }
 
 // =====================================================================
@@ -135,9 +144,6 @@ static void cmd_tssinfo() {
 
 // =====================================================================
 // Ring 3
-//
-// ring3_task corre en un hilo nuevo. Cuando el user hace exit,
-// thread_exit() mata ESE hilo (no kmain). La shell sigue viva.
 // =====================================================================
 static void ring3_task(void) {
     user_start();
@@ -797,8 +803,7 @@ static void cmd_diskwrite(const char *args) {
 }
 
 // =====================================================================
-// LOAD: copiar bytes del disco (LBA) a un archivo del FS
-// Uso: load <nombre> <lba>
+// LOAD
 // =====================================================================
 static void cmd_load(const char *args) {
     char name[64], lbastr[16];
@@ -813,13 +818,11 @@ static void cmd_load(const char *args) {
         return;
     }
 
-    // Parsear LBA
     uint32_t lba = 0;
     for (int i = 0; lbastr[i] >= '0' && lbastr[i] <= '9'; i++) {
         lba = lba * 10 + (lbastr[i] - '0');
     }
 
-    // Leer 8 sectores (4 KB)
     static uint8_t buf[4096];
     for (uint32_t s = 0; s < 8; s++) {
         if (!ahci_read_sector(lba + s, buf + s * 512)) {
@@ -828,7 +831,6 @@ static void cmd_load(const char *args) {
         }
     }
 
-    // Crear archivo en el FS (si ya existe, borrarlo y recrear)
     int fd = fs_open(name);
     if (fd >= 0) {
         fs_close(fd);
@@ -841,7 +843,6 @@ static void cmd_load(const char *args) {
         return;
     }
 
-    // Escribir los 4 KB
     int w = fs_write(fd, buf, 4096);
     fs_close(fd);
 
@@ -851,8 +852,7 @@ static void cmd_load(const char *args) {
 }
 
 // =====================================================================
-// RUN: ejecutar archivo del FS en ring 3
-// Uso: run <archivo>
+// RUN
 // =====================================================================
 static volatile uint32_t g_run_size = 0;
 static uint8_t g_run_buf[4096];
@@ -870,7 +870,6 @@ static void cmd_run(const char *args) {
         return;
     }
 
-    // Abrir archivo
     int fd = fs_open(args);
     if (fd < 0) {
         kprintf("run: no existe '%s' (%d)\n", args, fd);
@@ -884,7 +883,6 @@ static void cmd_run(const char *args) {
         return;
     }
 
-    // Leer bytes al buffer global
     int n = fs_read(fd, g_run_buf, 4096);
     fs_close(fd);
 
@@ -895,7 +893,6 @@ static void cmd_run(const char *args) {
 
     g_run_size = (uint32_t)n;
 
-    // Crear hilo para ejecutar en ring 3
     int tid = thread_create("run", run_task);
     if (tid < 0) {
         screen_write("run: no se pudo crear el hilo\n");
@@ -967,6 +964,7 @@ static void execute(const char *l) {
     else if (str_eq(l, "test"))         cmd_test();
     else if (str_eq(l, "tssinfo"))      cmd_tssinfo();
     else if (str_eq(l, "ring3"))        cmd_ring3();
+    else if (str_eq(l, "desktop"))      cmd_desktop();
     else if (str_eq(l, "ls"))           cmd_ls();
     else if (str_eq(l, "df"))           cmd_df();
     else if (str_eq(l, "diskinfo"))     cmd_diskinfo();
@@ -1008,7 +1006,7 @@ void shell_run() {
     while (1) {
         char c = keyboard_getchar();
         if (!c) {
-            thread_yield();     // ceder CPU mientras no hay tecla
+            thread_yield();
             continue;
         }
 
