@@ -1,6 +1,5 @@
 ; =====================================================================
-; Bootloader con E820, sin VBE (modo texto para diagnostico)
-; Compilar con: fasm boot.asm boot.bin
+; Bootloader mínimo: VBE + GDT + carga kernel
 ; =====================================================================
 format binary
 use16
@@ -10,7 +9,7 @@ start:
     jmp short boot_start
     nop
 
-; --- BPB ---
+; --- BPB (obligatorio para que la BIOS reconozca el disco) ---
 bpbOEM          db "MINIOS  "
 bpbBytesPerSec  dw 512
 bpbSecPerClus   db 1
@@ -32,8 +31,6 @@ bsVolLab        db "MINIOS     "
 bsFilSysType    db "FAT12   "
 
 ; =====================================================================
-; Arranque
-; =====================================================================
 boot_start:
     cli
     xor ax, ax
@@ -45,18 +42,12 @@ boot_start:
 
     mov [boot_drive], dl
 
-    mov si, msg_loading
-    call print_string
-
-    call e820_capture
-
-    ; --- Cargar kernel: 64 sectores desde LBA 1 a 0x10000 ---
+    ; Cargar kernel: 96 sectores desde LBA 1 a 0x10000
     mov ax, 0x1000
     mov es, ax
     xor bx, bx
-
     mov ah, 0x02
-    mov al, 96
+    mov al, 128
     mov ch, 0
     mov cl, 2
     mov dh, 0
@@ -64,52 +55,136 @@ boot_start:
     int 0x13
     jc disk_error
 
-    mov si, msg_jump
-    call print_string
+    ; ---- VBE ----
+    call vbe_setup
 
+    ; ---- Modo protegido ----
     cli
     lgdt [gdt_descriptor]
-
     mov eax, cr0
     or eax, 1
     mov cr0, eax
-
     jmp 0x08:pm_start
 
 ; =====================================================================
-; e820_capture
+; vbe_setup
+;
+; Prueba varios modos. Guarda info en 0x6000.
+;   0x6000: magic (0x31454256 "VBE1") o 0
+;   0x6004: framebuffer addr (u32)
+;   0x6008: pitch (u16)
+;   0x600A: width (u16)
+;   0x600C: height (u16)
+;   0x600E: bpp (u8)
 ; =====================================================================
-e820_capture:
+vbe_setup:
     pusha
+
+    mov dword [0x6000], 0
+
+    ; Consultar VBE info
     mov ax, 0x0000
     mov es, ax
-    mov di, 0x5004
-    xor ebx, ebx
-    xor bp, bp
-.e820_loop:
-    mov eax, 0xE820
-    mov edx, 0x534D4150
-    mov ecx, 24
-    int 0x15
-    jc .done
-    cmp eax, 0x534D4150
+    mov di, 0x6100
+    mov cx, 256
+    xor ax, ax
+    rep stosw
+    mov dword [0x6100], 0x32454256
+
+    mov ax, 0x4F00
+    mov di, 0x6100
+    int 0x10
+    cmp ax, 0x004F
     jne .done
-    test ebx, ebx
-    jz .done
-    add di, 24
-    inc bp
-    cmp bp, 64
-    jae .done
-    jmp .e820_loop
+
+    ; Probar modo 1024x768x32
+    mov cx, 0x011B
+    call vbe_try
+    jnc .done
+
+    ; Probar modo 1024x768x24
+    mov cx, 0x0118
+    call vbe_try
+    jnc .done
+
+    ; Probar modo 640x480x32
+    mov cx, 0x0112
+    call vbe_try
+    jnc .done
+
+    ; Probar modo 640x480x8
+    mov cx, 0x0101
+    call vbe_try
+    jnc .done
+
 .done:
-    mov ax, 0x0000
-    mov es, ax
-    mov [0x5000], bp
     popa
     ret
 
 ; =====================================================================
-; Modo protegido
+; vbe_try: intenta cambiar al modo CX. CF=0 si OK.
+; =====================================================================
+vbe_try:
+    pusha
+
+    mov [0x6300], cx
+
+    mov ax, 0x0000
+    mov es, ax
+    mov di, 0x6200
+    mov cx, 128
+    xor ax, ax
+    rep stosw
+
+    mov cx, [0x6300]
+    mov ax, 0x4F01
+    mov di, 0x6200
+    int 0x10
+    cmp ax, 0x004F
+    jne .fail
+
+    ; Verificar ModeAttributes (supported + LFB)
+    mov ax, [0x6200]
+    and ax, 0x0081
+    cmp ax, 0x0081
+    jne .fail
+
+    ; Cambiar al modo
+    mov cx, [0x6300]
+    mov bx, cx
+    or bx, 0x4000
+    mov ax, 0x4F02
+    int 0x10
+    cmp ax, 0x004F
+    jne .fail
+
+    ; Guardar info
+    mov ax, [0x6212]
+    mov [0x600A], ax
+    mov ax, [0x6214]
+    mov [0x600C], ax
+    mov al, [0x6219]
+    mov [0x600E], al
+    mov ax, [0x6210]
+    mov [0x6008], ax
+    mov eax, [0x6228]
+    mov [0x6004], eax
+
+    mov dword [0x6000], 0x31454256
+
+    popa
+    clc
+    ret
+
+.fail:
+    popa
+    stc
+    ret
+
+; =====================================================================
+disk_error:
+    jmp $
+
 ; =====================================================================
 use32
 pm_start:
@@ -122,28 +197,6 @@ pm_start:
     mov esp, 0x90000
     jmp 0x10000
 
-; =====================================================================
-; Rutinas modo real
-; =====================================================================
-use16
-print_string:
-    mov ah, 0x0E
-.next:
-    lodsb
-    cmp al, 0
-    je .done
-    int 0x10
-    jmp .next
-.done:
-    ret
-
-disk_error:
-    mov si, msg_error
-    call print_string
-    jmp $
-
-; =====================================================================
-; GDT
 ; =====================================================================
 gdt_start:
     dq 0
@@ -168,12 +221,7 @@ gdt_descriptor:
     dd gdt_start
 
 ; =====================================================================
-; Datos
-; =====================================================================
 boot_drive    db 0
-msg_loading   db "Cargando kernel...", 13, 10, 0
-msg_jump      db "Saltando a modo protegido...", 13, 10, 0
-msg_error     db "Error al leer el disco.", 13, 10, 0
 
 times 510 - ($ - $$) db 0
 dw 0xAA55
