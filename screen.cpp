@@ -1,6 +1,7 @@
 #include "screen.h"
 #include "gfx.h"
 #include "vbe.h"
+#include "pit.h"
 #include <stdarg.h>
 #include <stdint.h>
 
@@ -30,6 +31,54 @@ static uint32_t gfx_bg = 0x00000000;
 #define GFX_CHAR_W  8
 #define GFX_CHAR_H  16
 #define GFX_MARGIN  4
+
+// =====================================================================
+// Cursor parpadeante (solo modo gráfico)
+// =====================================================================
+#define CURSOR_BLINK_TICKS  50   // 100 Hz → 0.5 s
+
+static int          cursor_visible   = 1;
+static unsigned int cursor_last_tick = 0;
+
+// Dibuja un pequeño rectángulo en la base del cursor actual
+static void draw_cursor_gfx(uint32_t color) {
+    if (!gfx_mode) return;
+    if (gfx_cursor_x <= 0) return;
+    gfx_fill_rect(gfx_cursor_x, gfx_cursor_y + GFX_CHAR_H - 2,
+                  GFX_CHAR_W, 2, color);
+}
+
+static void erase_cursor_gfx(void) {
+    draw_cursor_gfx(gfx_bg);
+}
+
+// Actualiza el parpadeo según el timer.
+// Llamar periódicamente (desde shell_run o desde screen_putchar).
+static void update_cursor_blink(void) {
+    if (!gfx_mode) return;
+
+    unsigned int now = pit_get_ticks();
+    if (now - cursor_last_tick >= CURSOR_BLINK_TICKS) {
+        cursor_last_tick = now;
+        cursor_visible = !cursor_visible;
+
+        if (cursor_visible) draw_cursor_gfx(gfx_fg);
+        else                erase_cursor_gfx();
+    }
+}
+
+// Al mover el cursor: repintar el nuevo
+static void move_cursor_gfx(void) {
+    if (!gfx_mode) return;
+    cursor_visible = 1;
+    cursor_last_tick = pit_get_ticks();
+    draw_cursor_gfx(gfx_fg);
+}
+
+// Expuesto a shell.cpp para el parpadeo en reposo
+ void screen_blink_tick(void) {
+    update_cursor_blink();
+}
 
 // =====================================================================
 // Helpers VGA
@@ -72,15 +121,16 @@ static void screen_scroll_gfx(void) {
 
 // =====================================================================
 // Set modo
-//
-// SIN extern "C" — linkage C++ por defecto (coincide con screen.h).
 // =====================================================================
 void screen_set_gfx_mode(void) {
     if (vbe_available() && gfx_ready()) {
         gfx_mode = 1;
         gfx_cursor_x = GFX_MARGIN;
         gfx_cursor_y = GFX_MARGIN;
+        cursor_visible = 1;
+        cursor_last_tick = pit_get_ticks();
         gfx_clear(gfx_bg);
+        draw_cursor_gfx(gfx_fg);
     }
 }
 
@@ -97,6 +147,9 @@ void screen_clear(void) {
         gfx_clear(gfx_bg);
         gfx_cursor_x = GFX_MARGIN;
         gfx_cursor_y = GFX_MARGIN;
+        cursor_visible = 1;
+        cursor_last_tick = pit_get_ticks();
+        draw_cursor_gfx(gfx_fg);
         return;
     }
 
@@ -109,17 +162,25 @@ void screen_clear(void) {
 }
 
 void screen_putchar(char c) {
+    // Actualizar el parpadeo en cada llamada
+    update_cursor_blink();
+
     if (gfx_mode) {
+        // Borrar el cursor antes de escribir
+        erase_cursor_gfx();
+
         if (c == '\n') {
             gfx_cursor_x = GFX_MARGIN;
             gfx_cursor_y += GFX_CHAR_H;
             if (gfx_cursor_y + GFX_CHAR_H > gfx_height()) {
                 screen_scroll_gfx();
             }
+            move_cursor_gfx();
             return;
         }
         if (c == '\r') {
             gfx_cursor_x = GFX_MARGIN;
+            move_cursor_gfx();
             return;
         }
         if (c == '\b') {
@@ -128,6 +189,7 @@ void screen_putchar(char c) {
                 gfx_fill_rect(gfx_cursor_x, gfx_cursor_y,
                               GFX_CHAR_W, GFX_CHAR_H, gfx_bg);
             }
+            move_cursor_gfx();
             return;
         }
 
@@ -141,6 +203,7 @@ void screen_putchar(char c) {
                 screen_scroll_gfx();
             }
         }
+        move_cursor_gfx();
         return;
     }
 

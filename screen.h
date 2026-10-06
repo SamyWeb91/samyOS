@@ -10,3 +10,6 @@ void screen_set_gfx_mode(void);
 
 // Colores de texto (opcional)
 void screen_set_colors(unsigned int fg, unsigned int bg);
+
+// Cursor parpadeante (llamar desde el bucle de la shell)
+void screen_blink_tick(void);

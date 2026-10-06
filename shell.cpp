@@ -1006,6 +1006,7 @@ void shell_run() {
     while (1) {
         char c = keyboard_getchar();
         if (!c) {
+            screen_blink_tick();   // ← NUEVO: hace parpadear el cursor
             thread_yield();
             continue;
         }
