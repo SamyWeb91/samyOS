@@ -38,7 +38,7 @@ void worker2(void) {
 // =====================================================================
 extern "C" void kernel_main(void) {
     // =============================================================
-    // PASO 1: init básico (sin prints — aún no hay salida visible)
+    // PASO 1: init básico
     // =============================================================
     idt_init();
     gdt_init();
@@ -52,21 +52,13 @@ extern "C" void kernel_main(void) {
 
     // =============================================================
     // PASO 2: VBE + GFX
-    //
-    // El bootloader cambió a modo gráfico. Hay que:
-    //   1. Leer info VBE de 0x6000.
-    //   2. Mapear el framebuffer (gfx_init).
-    //   3. Activar el modo gráfico en screen.cpp (screen_set_gfx_mode).
-    //
-    // A partir de aquí, kprintf dibuja en el framebuffer.
     // =============================================================
     vbe_init();
 
     if (vbe_available()) {
         gfx_init();
-        screen_set_gfx_mode();     // ← CLAVE: activa el modo gráfico en screen.cpp
+        screen_set_gfx_mode();
 
-        // Ahora ya se ve el output
         kprintf("MiniOS v5.0 + VBE\n");
         kprintf("=================\n\n");
         kprintf("VBE: %ux%u %ubpp\n",
@@ -74,14 +66,10 @@ extern "C" void kernel_main(void) {
         kprintf("FB:  %x  pitch=%u bytes\n",
                 vbe_fb_addr(), vbe_pitch());
         kprintf("\n");
-    } else {
-        // VBE no disponible: el bootloader cambió a gráfico pero no hay info.
-        // No se verá nada. Pero el kernel sigue.
-        // (No podemos imprimir nada visible.)
     }
 
     // =============================================================
-    // PASO 3: resto del init (ya visible)
+    // PASO 3: resto del init
     // =============================================================
     kprintf("IDT cargada\n");
     kprintf("GDT recargada\n");
@@ -92,22 +80,29 @@ extern "C" void kernel_main(void) {
     kprintf("Heap inicializado\n");
     kprintf("Paginacion activada\n");
 
-    paging_map_range(0xFE000000, 0xFE000000, 32768, PTE_PRESENT | PTE_RW);
-    kprintf("MMIO mapeado (0xFE000000 - 0xFFFFFFFF)\n");
+    // MMIO se mapea dinamicamente en ahci_get_abar (no lo usamos ahora)
+    kprintf("MMIO: no mapeado (modo seguro, sin AHCI)\n");
 
     kprintf("\n");
     syscall_init();
 
     user_init();
 
+    // =============================================================
+    // AHCI + FS: DESHABILITADOS para modo seguro en hardware real
+    //
+    // Descomentar estas lineas para volver al modo normal con disco.
+    // =============================================================
     kprintf("\n");
-    if (ahci_init()) {
-        kprintf("AHCI listo\n");
-    } else {
-        kprintf("AHCI no disponible\n");
-    }
+    kprintf("[MODO SEGURO] AHCI y FS deshabilitados (no se toca el disco)\n");
 
-    fs_init();
+    // if (ahci_init()) {
+    //     kprintf("AHCI listo\n");
+    // } else {
+    //     kprintf("AHCI no disponible\n");
+    // }
+    //
+    // fs_init();
 
     kprintf("\n");
     thread_init();
