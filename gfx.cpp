@@ -3,12 +3,39 @@
 #include "screen.h"
 #include "paging.h"
 
+// Fuente 8x16 exportada por font8x16.c
 extern "C" uint8_t font8x16[256][16];
 
-static uint32_t *fb = 0;
-static int      fb_w = 0;
-static int      fb_h = 0;
-static int      fb_pitch_pixels = 0;
+// =====================================================================
+// Estado del driver
+// =====================================================================
+static uint8_t *fb          = 0;   // framebuffer (byte pointer)
+static int      fb_w        = 0;   // ancho en píxeles
+static int      fb_h        = 0;   // alto en píxeles
+static int      fb_pitch    = 0;   // bytes por línea (del VBE)
+static int      fb_bpp      = 0;   // bits por píxel (24 o 32)
+static int      fb_bytes_pp = 0;   // bytes por píxel (3 o 4)
+
+// =====================================================================
+// Helpers internos
+// =====================================================================
+
+// Escribe un píxel en la dirección p según el bpp actual.
+// p apunta al primer byte del píxel.
+static inline void putpixel_at(uint8_t *p, uint32_t color) {
+    if (fb_bpp == 32) {
+        // 32bpp: BGRA (QEMU usa BGRX en little-endian)
+        p[0] = (color      ) & 0xFF;   // B
+        p[1] = (color >>  8) & 0xFF;   // G
+        p[2] = (color >> 16) & 0xFF;   // R
+        p[3] = 0;                      // X
+    } else {
+        // 24bpp: BGR
+        p[0] = (color      ) & 0xFF;   // B
+        p[1] = (color >>  8) & 0xFF;   // G
+        p[2] = (color >> 16) & 0xFF;   // R
+    }
+}
 
 // =====================================================================
 // Init
@@ -21,40 +48,53 @@ extern "C" void gfx_init(void) {
     }
 
     uint32_t addr = vbe_fb_addr();
-    fb_w = vbe_width();
-    fb_h = vbe_height();
-    fb_pitch_pixels = vbe_pitch() / 4;   // bpp = 32 → 4 bytes/pixel
+    fb_w     = vbe_width();
+    fb_h     = vbe_height();
+    fb_pitch = vbe_pitch();
+    fb_bpp   = vbe_bpp();
 
-    // Mapear el framebuffer (puede estar en 0xE0000000, 0xFD000000, etc.)
-    // Mapear 4 MB para cubrir 1024x768x32
-    paging_map_range(addr, addr, 4096, PTE_PRESENT | PTE_RW);
+    if (fb_bpp == 32)      fb_bytes_pp = 4;
+    else if (fb_bpp == 24) fb_bytes_pp = 3;
+    else {
+        kprintf("gfx: bpp=%u no soportado\n", fb_bpp);
+        fb = 0;
+        return;
+    }
 
-    fb = (uint32_t *)addr;
+    // Mapear el framebuffer.
+    // 1280*1024*4 = 5 MB. Mapear 8 MB por seguridad.
+    uint32_t size_mb = (fb_pitch * fb_h + 0xFFFFF) / 0x100000 + 1;
+    paging_map_range(addr, addr, size_mb * 1024, PTE_PRESENT | PTE_RW);
 
-    kprintf("gfx: %dx%d, pitch=%d, fb=%x\n",
-            fb_w, fb_h, vbe_pitch(), addr);
+    fb = (uint8_t *)addr;
+
+    kprintf("gfx: %dx%d %ubpp pitch=%u bytes fb=%x (mapeado %u MB)\n",
+            fb_w, fb_h, fb_bpp, fb_pitch, addr, size_mb);
 }
 
-extern "C" int gfx_ready(void) {
-    return fb != 0;
-}
-
-extern "C" int gfx_width(void)  { return fb_w; }
-extern "C" int gfx_height(void) { return fb_h; }
+extern "C" int gfx_ready(void)      { return fb != 0; }
+extern "C" int gfx_width(void)      { return fb_w; }
+extern "C" int gfx_height(void)     { return fb_h; }
+extern "C" int gfx_bpp(void)        { return fb_bpp; }
 
 // =====================================================================
-// Primitivas
+// Pixel
 // =====================================================================
 extern "C" void gfx_putpixel(int x, int y, uint32_t color) {
     if (!fb) return;
     if (x < 0 || x >= fb_w || y < 0 || y >= fb_h) return;
-    fb[y * fb_pitch_pixels + x] = color;
+
+    uint8_t *p = fb + (uint32_t)y * fb_pitch + (uint32_t)x * fb_bytes_pp;
+    putpixel_at(p, color);
 }
 
+// =====================================================================
+// Rectángulo relleno
+// =====================================================================
 extern "C" void gfx_fill_rect(int x, int y, int w, int h, uint32_t color) {
     if (!fb) return;
 
-    // Recortar a la pantalla
+    // Recortar
     if (x < 0) { w += x; x = 0; }
     if (y < 0) { h += y; y = 0; }
     if (x + w > fb_w) w = fb_w - x;
@@ -62,9 +102,11 @@ extern "C" void gfx_fill_rect(int x, int y, int w, int h, uint32_t color) {
     if (w <= 0 || h <= 0) return;
 
     for (int row = 0; row < h; row++) {
-        uint32_t *line = fb + (y + row) * fb_pitch_pixels + x;
+        uint8_t *p = fb + (uint32_t)(y + row) * fb_pitch
+                        + (uint32_t)x * fb_bytes_pp;
         for (int col = 0; col < w; col++) {
-            line[col] = color;
+            putpixel_at(p, color);
+            p += fb_bytes_pp;
         }
     }
 }
@@ -75,7 +117,60 @@ extern "C" void gfx_clear(uint32_t color) {
 }
 
 // =====================================================================
-// Texto (fuente 8x16)
+// Marco (rectángulo sin relleno)
+// =====================================================================
+extern "C" void gfx_draw_rect(int x, int y, int w, int h, uint32_t color) {
+    if (!fb) return;
+    // Lados horizontales
+    gfx_fill_rect(x, y,         w, 1, color);
+    gfx_fill_rect(x, y + h - 1, w, 1, color);
+    // Lados verticales
+    gfx_fill_rect(x,         y, 1, h, color);
+    gfx_fill_rect(x + w - 1, y, 1, h, color);
+}
+
+// =====================================================================
+// Copiar región del framebuffer (para scroll)
+//
+// Copia el rectángulo (src_x, src_y) de tamaño (w, h) a (dst_x, dst_y).
+// Se hace de arriba a abajo para que no se solapen mal.
+// =====================================================================
+extern "C" void gfx_copy_rect(int src_x, int src_y,
+                              int dst_x, int dst_y,
+                              int w, int h) {
+    if (!fb) return;
+    if (w <= 0 || h <= 0) return;
+
+    // Recortar contra la pantalla
+    if (src_x < 0 || src_y < 0 || dst_x < 0 || dst_y < 0) return;
+    if (src_x + w > fb_w || dst_x + w > fb_w) return;
+    if (src_y + h > fb_h || dst_y + h > fb_h) return;
+
+    int bytes = w * fb_bytes_pp;
+
+    if (dst_y < src_y) {
+        // Copiar de arriba hacia abajo
+        for (int row = 0; row < h; row++) {
+            uint8_t *s = fb + (uint32_t)(src_y + row) * fb_pitch
+                            + (uint32_t)src_x * fb_bytes_pp;
+            uint8_t *d = fb + (uint32_t)(dst_y + row) * fb_pitch
+                            + (uint32_t)dst_x * fb_bytes_pp;
+            for (int i = 0; i < bytes; i++) d[i] = s[i];
+        }
+    } else {
+        // Copiar de abajo hacia arriba (evita solapes)
+        for (int row = h - 1; row >= 0; row--) {
+            uint8_t *s = fb + (uint32_t)(src_y + row) * fb_pitch
+                            + (uint32_t)src_x * fb_bytes_pp;
+            uint8_t *d = fb + (uint32_t)(dst_y + row) * fb_pitch
+                            + (uint32_t)dst_x * fb_bytes_pp;
+            for (int i = 0; i < bytes; i++) d[i] = s[i];
+        }
+    }
+}
+
+// =====================================================================
+// Texto
 // =====================================================================
 extern "C" void gfx_draw_char(int x, int y, char c, uint32_t fg, uint32_t bg) {
     if (!fb) return;
@@ -92,7 +187,8 @@ extern "C" void gfx_draw_char(int x, int y, char c, uint32_t fg, uint32_t bg) {
     }
 }
 
-extern "C" void gfx_draw_string(int x, int y, const char *s, uint32_t fg, uint32_t bg) {
+extern "C" void gfx_draw_string(int x, int y, const char *s,
+                                uint32_t fg, uint32_t bg) {
     int cx = x;
     int cy = y;
     while (*s) {

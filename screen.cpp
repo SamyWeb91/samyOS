@@ -5,7 +5,7 @@
 #include <stdint.h>
 
 // =====================================================================
-// Buffer de texto VGA (0xB8000) — usado cuando NO hay gfx
+// Buffer VGA (modo texto) — solo si no hay VBE
 // =====================================================================
 #define VGA_MEM    ((volatile uint16_t *)0xB8000)
 #define VGA_W      80
@@ -13,33 +13,29 @@
 
 static int cursor_x = 0;
 static int cursor_y = 0;
-
-static uint8_t text_color = 0x07;   // gris claro sobre negro
+static uint8_t text_color = 0x07;
 static uint8_t back_color = 0x00;
 
 // =====================================================================
-// Estado de gfx (modo gráfico)
+// Estado del modo gráfico
 // =====================================================================
-static int gfx_mode = 0;   // 1 si estamos en modo gráfico
+static int gfx_mode = 0;
 
-// Cursor en modo gráfico (en píxeles)
 static int gfx_cursor_x = 0;
 static int gfx_cursor_y = 0;
+
+static uint32_t gfx_fg = 0x00CCCCCC;
+static uint32_t gfx_bg = 0x00000000;
 
 #define GFX_CHAR_W  8
 #define GFX_CHAR_H  16
 #define GFX_MARGIN  4
 
-// Colores del framebuffer (RRGGBB)
-#define GFX_FG_COLOR  0x00CCCCCC   // gris claro
-#define GFX_BG_COLOR  0x00000000   // negro
-
 // =====================================================================
-// Internos
+// Helpers VGA
 // =====================================================================
 static void screen_update_cursor_vga(void) {
     uint16_t pos = cursor_y * VGA_W + cursor_x;
-    // Puerto del cursor VGA (0x3D4 / 0x3D5)
     asm volatile("outb %0, %1" : : "a"((uint8_t)0x0F), "Nd"((uint16_t)0x3D4));
     asm volatile("outb %0, %1" : : "a"((uint8_t)(pos & 0xFF)), "Nd"((uint16_t)0x3D5));
     asm volatile("outb %0, %1" : : "a"((uint8_t)0x0E), "Nd"((uint16_t)0x3D4));
@@ -49,43 +45,48 @@ static void screen_update_cursor_vga(void) {
 static void screen_scroll_vga(void) {
     if (cursor_y < VGA_H) return;
 
-    // Mover todo el buffer una línea hacia arriba
     for (int i = 0; i < (VGA_H - 1) * VGA_W; i++) {
         VGA_MEM[i] = VGA_MEM[i + VGA_W];
     }
-    // Limpiar la última línea
     for (int i = (VGA_H - 1) * VGA_W; i < VGA_H * VGA_W; i++) {
         VGA_MEM[i] = (back_color << 12) | (text_color << 8) | ' ';
     }
     cursor_y = VGA_H - 1;
 }
 
+// =====================================================================
+// Scroll gráfico
+// =====================================================================
 static void screen_scroll_gfx(void) {
-    // Scroll en modo gráfico: desplazar el framebuffer hacia arriba
-    // GFX_CHAR_H píxeles.
     if (gfx_cursor_y + GFX_CHAR_H <= gfx_height()) return;
 
-    // Re-dibujar toda la pantalla desde la línea siguiente.
-    // (simple, pero funciona)
-    // Alternativa más eficiente: memmove en el framebuffer.
-    // Por ahora, solo lo dejamos "limpio" con scroll no-op.
+    int W = gfx_width();
+    int H = gfx_height();
 
-    // Scroll simple: limpiar y empezar arriba
-    gfx_clear(GFX_BG_COLOR);
-    gfx_cursor_x = GFX_MARGIN;
-    gfx_cursor_y = GFX_MARGIN;
+    gfx_copy_rect(0, GFX_CHAR_H, 0, 0, W, H - GFX_CHAR_H);
+    gfx_fill_rect(0, H - GFX_CHAR_H, W, GFX_CHAR_H, gfx_bg);
+
+    gfx_cursor_y -= GFX_CHAR_H;
+    if (gfx_cursor_y < GFX_MARGIN) gfx_cursor_y = GFX_MARGIN;
 }
 
 // =====================================================================
-// Init
+// Set modo
+//
+// SIN extern "C" — linkage C++ por defecto (coincide con screen.h).
 // =====================================================================
-// Llamar a esto después de gfx_init() si VBE está disponible.
-extern "C" void screen_set_gfx_mode(void) {
+void screen_set_gfx_mode(void) {
     if (vbe_available() && gfx_ready()) {
         gfx_mode = 1;
         gfx_cursor_x = GFX_MARGIN;
         gfx_cursor_y = GFX_MARGIN;
+        gfx_clear(gfx_bg);
     }
+}
+
+void screen_set_colors(unsigned int fg, unsigned int bg) {
+    gfx_fg = fg & 0x00FFFFFF;
+    gfx_bg = bg & 0x00FFFFFF;
 }
 
 // =====================================================================
@@ -93,7 +94,7 @@ extern "C" void screen_set_gfx_mode(void) {
 // =====================================================================
 void screen_clear(void) {
     if (gfx_mode) {
-        gfx_clear(GFX_BG_COLOR);
+        gfx_clear(gfx_bg);
         gfx_cursor_x = GFX_MARGIN;
         gfx_cursor_y = GFX_MARGIN;
         return;
@@ -124,14 +125,13 @@ void screen_putchar(char c) {
         if (c == '\b') {
             if (gfx_cursor_x > GFX_MARGIN) {
                 gfx_cursor_x -= GFX_CHAR_W;
-                gfx_draw_char(gfx_cursor_x, gfx_cursor_y, ' ',
-                              GFX_FG_COLOR, GFX_BG_COLOR);
+                gfx_fill_rect(gfx_cursor_x, gfx_cursor_y,
+                              GFX_CHAR_W, GFX_CHAR_H, gfx_bg);
             }
             return;
         }
 
-        gfx_draw_char(gfx_cursor_x, gfx_cursor_y, c,
-                      GFX_FG_COLOR, GFX_BG_COLOR);
+        gfx_draw_char(gfx_cursor_x, gfx_cursor_y, c, gfx_fg, gfx_bg);
 
         gfx_cursor_x += GFX_CHAR_W;
         if (gfx_cursor_x + GFX_CHAR_W > gfx_width()) {
@@ -171,14 +171,11 @@ void screen_putchar(char c) {
 }
 
 void screen_write(const char *str) {
-    while (*str) {
-        screen_putchar(*str);
-        str++;
-    }
+    while (*str) screen_putchar(*str++);
 }
 
 // =====================================================================
-// kprintf (formato mínimo: %s, %c, %u, %d, %x, %p, %%)
+// kprintf
 // =====================================================================
 static void kprint_u32(unsigned int v, int base, int pad, char padc) {
     char buf[32];
@@ -193,7 +190,6 @@ static void kprint_u32(unsigned int v, int base, int pad, char padc) {
             v /= base;
         }
     }
-
     while (i < pad) buf[i++] = padc;
     while (i > 0) {
         i--;

@@ -18,7 +18,7 @@
 #include "gfx.h"
 
 // Declarado en screen.cpp
-extern "C" void screen_set_gfx_mode(void);
+ void screen_set_gfx_mode(void);
 
 // =====================================================================
 // Workers
