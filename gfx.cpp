@@ -21,20 +21,25 @@ static int      fb_bytes_pp = 0;   // bytes por píxel (3 o 4)
 // =====================================================================
 
 // Escribe un píxel en la dirección p según el bpp actual.
-// p apunta al primer byte del píxel.
 static inline void putpixel_at(uint8_t *p, uint32_t color) {
     if (fb_bpp == 32) {
-        // 32bpp: BGRA (QEMU usa BGRX en little-endian)
         p[0] = (color      ) & 0xFF;   // B
         p[1] = (color >>  8) & 0xFF;   // G
         p[2] = (color >> 16) & 0xFF;   // R
         p[3] = 0;                      // X
     } else {
-        // 24bpp: BGR
         p[0] = (color      ) & 0xFF;   // B
         p[1] = (color >>  8) & 0xFF;   // G
         p[2] = (color >> 16) & 0xFF;   // R
     }
+}
+
+// Lee un píxel de la dirección p y lo devuelve en formato 0x00RRGGBB.
+static inline uint32_t getpixel_at(const uint8_t *p) {
+    uint32_t b = p[0];
+    uint32_t g = p[1];
+    uint32_t r = p[2];
+    return (r << 16) | (g << 8) | b;
 }
 
 // =====================================================================
@@ -61,8 +66,6 @@ extern "C" void gfx_init(void) {
         return;
     }
 
-    // Mapear el framebuffer.
-    // 1280*1024*4 = 5 MB. Mapear 8 MB por seguridad.
     uint32_t size_mb = (fb_pitch * fb_h + 0xFFFFF) / 0x100000 + 1;
     paging_map_range(addr, addr, size_mb * 1024, PTE_PRESENT | PTE_RW);
 
@@ -88,13 +91,21 @@ extern "C" void gfx_putpixel(int x, int y, uint32_t color) {
     putpixel_at(p, color);
 }
 
+extern "C" uint32_t gfx_getpixel(int x, int y) {
+    if (!fb) return 0;
+    if (x < 0 || x >= fb_w || y < 0 || y >= fb_h) return 0;
+
+    const uint8_t *p = fb + (uint32_t)y * fb_pitch
+                          + (uint32_t)x * fb_bytes_pp;
+    return getpixel_at(p);
+}
+
 // =====================================================================
 // Rectángulo relleno
 // =====================================================================
 extern "C" void gfx_fill_rect(int x, int y, int w, int h, uint32_t color) {
     if (!fb) return;
 
-    // Recortar
     if (x < 0) { w += x; x = 0; }
     if (y < 0) { h += y; y = 0; }
     if (x + w > fb_w) w = fb_w - x;
@@ -121,19 +132,14 @@ extern "C" void gfx_clear(uint32_t color) {
 // =====================================================================
 extern "C" void gfx_draw_rect(int x, int y, int w, int h, uint32_t color) {
     if (!fb) return;
-    // Lados horizontales
     gfx_fill_rect(x, y,         w, 1, color);
     gfx_fill_rect(x, y + h - 1, w, 1, color);
-    // Lados verticales
     gfx_fill_rect(x,         y, 1, h, color);
     gfx_fill_rect(x + w - 1, y, 1, h, color);
 }
 
 // =====================================================================
 // Copiar región del framebuffer (para scroll)
-//
-// Copia el rectángulo (src_x, src_y) de tamaño (w, h) a (dst_x, dst_y).
-// Se hace de arriba a abajo para que no se solapen mal.
 // =====================================================================
 extern "C" void gfx_copy_rect(int src_x, int src_y,
                               int dst_x, int dst_y,
@@ -141,7 +147,6 @@ extern "C" void gfx_copy_rect(int src_x, int src_y,
     if (!fb) return;
     if (w <= 0 || h <= 0) return;
 
-    // Recortar contra la pantalla
     if (src_x < 0 || src_y < 0 || dst_x < 0 || dst_y < 0) return;
     if (src_x + w > fb_w || dst_x + w > fb_w) return;
     if (src_y + h > fb_h || dst_y + h > fb_h) return;
@@ -149,7 +154,6 @@ extern "C" void gfx_copy_rect(int src_x, int src_y,
     int bytes = w * fb_bytes_pp;
 
     if (dst_y < src_y) {
-        // Copiar de arriba hacia abajo
         for (int row = 0; row < h; row++) {
             uint8_t *s = fb + (uint32_t)(src_y + row) * fb_pitch
                             + (uint32_t)src_x * fb_bytes_pp;
@@ -158,7 +162,6 @@ extern "C" void gfx_copy_rect(int src_x, int src_y,
             for (int i = 0; i < bytes; i++) d[i] = s[i];
         }
     } else {
-        // Copiar de abajo hacia arriba (evita solapes)
         for (int row = h - 1; row >= 0; row--) {
             uint8_t *s = fb + (uint32_t)(src_y + row) * fb_pitch
                             + (uint32_t)src_x * fb_bytes_pp;

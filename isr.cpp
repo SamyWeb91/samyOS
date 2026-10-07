@@ -4,6 +4,7 @@
 #include "pit.h"
 #include "keyboard.h"
 #include "thread.h"
+#include "mouse.h"      // ← NUEVO: declara mouse_handler()
 
 extern "C" void isr_handler(Regs *r) {
     // Excepciones (0-31)
@@ -29,6 +30,9 @@ extern "C" void isr_handler(Regs *r) {
 
         if (irq == 1) {
             keyboard_handler();
+        }
+        else if (irq == 12) {
+            mouse_handler();
         }
 
         pic_send_eoi(irq);

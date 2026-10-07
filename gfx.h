@@ -45,6 +45,7 @@ int gfx_bpp(void);
 // Primitivas
 // =====================================================================
 void gfx_putpixel(int x, int y, uint32_t color);
+uint32_t gfx_getpixel(int x, int y);                       // ← NUEVO
 void gfx_fill_rect(int x, int y, int w, int h, uint32_t color);
 void gfx_clear(uint32_t color);
 void gfx_draw_rect(int x, int y, int w, int h, uint32_t color);
