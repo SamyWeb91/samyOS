@@ -10,8 +10,9 @@
 #define PS2_STATUS  0x64
 #define PS2_CMD     0x64
 
-#define PS2_STATUS_OUTPUT   0x01
-#define PS2_STATUS_INPUT    0x02
+#define PS2_STATUS_OUTPUT   0x01   // bit 0: hay dato en 0x60
+#define PS2_STATUS_INPUT    0x02   // bit 1: buffer de entrada lleno
+#define PS2_STATUS_MOUSE    0x20   // bit 5: el dato viene del ratón
 
 // =====================================================================
 // Estado del ratón
@@ -27,110 +28,130 @@ static uint8_t packet[3];
 static int     packet_idx = 0;
 
 // =====================================================================
-// Helpers
+// Helpers 8042
 // =====================================================================
-static void ps2_wait_write(void) {
-    int t = 100000;
-    while ((inb(PS2_STATUS) & PS2_STATUS_INPUT) && --t) {}
+
+// Espera a que el buffer de entrada del 8042 esté libre (bit1 = 0)
+static void kbc_wait_write(void) {
+    for (int i = 0; i < 100000; i++) {
+        if ((inb(PS2_STATUS) & PS2_STATUS_INPUT) == 0) return;
+    }
 }
 
-static int ps2_wait_read(void) {
-    int t = 100000;
-    while (!(inb(PS2_STATUS) & PS2_STATUS_OUTPUT) && --t) {}
-    return t > 0;
+// Espera a que haya un dato listo en el buffer de salida (bit0 = 1)
+static void kbc_wait_read(void) {
+    for (int i = 0; i < 100000; i++) {
+        if (inb(PS2_STATUS) & PS2_STATUS_OUTPUT) return;
+    }
 }
 
-static void ps2_send_cmd(uint8_t cmd) {
-    ps2_wait_write();
+// Vacía todo lo que haya pendiente en el buffer de salida
+static void kbc_flush(void) {
+    for (int i = 0; i < 100; i++) {
+        if (!(inb(PS2_STATUS) & PS2_STATUS_OUTPUT)) break;
+        inb(PS2_DATA);
+    }
+}
+
+// Escribe un comando al controlador (puerto 0x64)
+static void kbc_cmd(uint8_t cmd) {
+    kbc_wait_write();
     outb(PS2_CMD, cmd);
 }
 
-static void ps2_send_data(uint8_t data) {
-    ps2_wait_write();
+// Escribe un dato al puerto 0x60
+static void kbc_data(uint8_t data) {
+    kbc_wait_write();
     outb(PS2_DATA, data);
 }
 
-static uint8_t ps2_read_data(void) {
-    if (!ps2_wait_read()) return 0xFF;
-    return inb(PS2_DATA);
-}
-
-static int mouse_send_cmd(uint8_t cmd) {
-    ps2_send_cmd(0xD4);
-    ps2_send_data(cmd);
-
-    int t = 10000;
-    while (!(inb(PS2_STATUS) & PS2_STATUS_OUTPUT) && --t) {}
-    if (t == 0) return 0;
-
+// Envía un byte al RATÓN (prefijo 0xD4) y espera ACK 0xFA
+static int mouse_write(uint8_t val) {
+    kbc_cmd(0xD4);
+    kbc_data(val);
+    kbc_wait_read();
     uint8_t ack = inb(PS2_DATA);
-    return (ack == 0xFA) ? 1 : 0;
+    return (ack == 0xFA);
 }
 
 // =====================================================================
 // Init
 // =====================================================================
 extern "C" int mouse_init(void) {
-    asm volatile("cli");
+    asm volatile("cli");   // proteger el PS/2 durante init
 
     kprintf("Mouse: inicializando...\n");
 
-    // 1. Habilitar el puerto auxiliar
-    ps2_send_cmd(0xA8);
+    packet_idx = 0;
+    mouse_ready = 0;
+    mouse_btn_left = 0;
+    mouse_btn_right = 0;
+    mouse_btn_mid = 0;
 
-    // 2. Leer config del 8042
-    ps2_send_cmd(0x20);
-    uint8_t config = ps2_read_data();
-    kprintf("Mouse: config = %x\n", config);
+    kbc_flush();
 
-    // 3. Modificar config: IRQ1 + IRQ12, clock ON
-    config |= 0x03;
-    config &= ~0x30;
-    ps2_send_cmd(0x60);
-    ps2_send_data(config);
+    // 1. Habilitar el puerto auxiliar (ratón)
+    kbc_cmd(0xA8);
 
-    // 4. Reset del ratón
-    kprintf("Mouse: reset...\n");
-    if (!mouse_send_cmd(0xFF)) {
-        kprintf("Mouse: no responde al reset\n");
+    // 2. Leer el "Compaq status byte" del 8042
+    kbc_cmd(0x20);
+    kbc_wait_read();
+    uint8_t status = inb(PS2_DATA);
+    kprintf("Mouse: config = %x\n", status);
+
+    // 3. Activar IRQ1 (teclado) + IRQ12 (ratón), clock ON en ambos
+    status |=  0x03;    // bit0 = IRQ1, bit1 = IRQ12
+    status &= ~0x30;    // bit4/5 = clock teclado/ratón ON
+    kbc_cmd(0x60);
+    kbc_data(status);
+
+    // 4. Poner el ratón en modo por defecto
+    if (!mouse_write(0xF6)) {
+        kprintf("Mouse: no responde a 0xF6\n");
         asm volatile("sti");
         return 0;
     }
+    kbc_flush();
 
-    // 5. Vaciar TODO lo que el reset deje pendiente
-    //    (0xFA ya lo leyó mouse_send_cmd; quedan 0xAA y 0x00)
-    int t = 100000;
-    while ((inb(PS2_STATUS) & PS2_STATUS_OUTPUT) && --t) {
-        inb(PS2_DATA);
+    // 5. Habilitar streaming de paquetes
+    if (!mouse_write(0xF4)) {
+        kprintf("Mouse: no responde a 0xF4\n");
+        asm volatile("sti");
+        return 0;
     }
+    kbc_flush();
 
-    // ==========================================================
-    // ETAPA 1: NO habilitar reporting (0xF4).
-    // Si se envía 0xF4 sin IRQ12 desenmascarada + handler,
-    // el ratón llena el buffer del 8042 y el teclado se cuelga.
-    // ==========================================================
-     kprintf("Mouse: enable reporting...\n");
-     if (!mouse_send_cmd(0xF4)) {
-         kprintf("Mouse: no responde al enable\n");
-         asm volatile("sti");
-         return 0;
-     }
-
-     pic_unmask_irq(12);   // ← sigue comentado en Etapa 1
+    // 6. Desenmascarar IRQ2 (cascade maestro→esclavo) + IRQ12 (ratón)
+    //    Sin IRQ2, las IRQs del esclavo (8-15) no llegan a la CPU.
+    pic_unmask_irq(2);
+    pic_unmask_irq(12);
 
     mouse_ready = 1;
-    kprintf("Mouse: LISTO (sin reporting)\n");
+    kprintf("Mouse: LISTO\n");
 
     asm volatile("sti");
     return 1;
 }
 
 // =====================================================================
-// Handler de IRQ12 (no se usa en Etapa 1, pero queda listo)
+// Handler de IRQ12
 // =====================================================================
 extern "C" void mouse_handler(void) {
+    uint8_t status = inb(PS2_STATUS);
+
+    // ¿Hay dato en 0x60?
+    if (!(status & PS2_STATUS_OUTPUT)) return;
+
+    // ¿El dato es del ratón?
+    // Si no lo es, NO lo leemos: es del teclado y lo debe consumir
+    // el handler del teclado. Esto evita "robarle" bytes al teclado
+    // y que se desincronice / cuelgue.
+    if (!(status & PS2_STATUS_MOUSE)) return;
+
     uint8_t data = inb(PS2_DATA);
 
+    // El byte 0 del paquete debe tener el bit 3 = 1.
+    // Si no, es basura o estamos desincronizados: reiniciar.
     if (packet_idx == 0 && !(data & 0x08)) return;
 
     packet[packet_idx++] = data;
@@ -138,29 +159,37 @@ extern "C" void mouse_handler(void) {
     packet_idx = 0;
 
     uint8_t flags = packet[0];
-    if (!(flags & 0x08)) return;
+
+    // Overflow en X o Y: descartar el paquete
     if (flags & 0xC0) return;
 
+    // Botones
     mouse_btn_left  = (flags & 0x01) ? 1 : 0;
     mouse_btn_right = (flags & 0x02) ? 1 : 0;
     mouse_btn_mid   = (flags & 0x04) ? 1 : 0;
 
+    // Desplazamiento X (con extensión de signo si bit4 = 1)
     int dx = (int)packet[1];
     if (flags & 0x10) dx |= 0xFFFFFF00;
 
+    // Desplazamiento Y (con extensión de signo si bit5 = 1)
     int dy = (int)packet[2];
     if (flags & 0x20) dy |= 0xFFFFFF00;
-    dy = -dy;
+    dy = -dy;   // Y del ratón es hacia arriba; la pantalla es al revés
 
     mouse_x += dx;
     mouse_y += dy;
+
+    // Sin clamp aquí: los límites los aplica desktop.cpp con
+    // gfx_width()/gfx_height() cuando dibuja el cursor.
+    // Así no dependemos de gfx_* dentro del handler.
 }
 
 // =====================================================================
 // Getters
 // =====================================================================
-extern "C" int mouse_is_ready(void)     { return mouse_ready; }
-extern "C" int mouse_get_x(void)        { return mouse_x; }
-extern "C" int mouse_get_y(void)        { return mouse_y; }
-extern "C" int mouse_left_pressed(void) { return mouse_btn_left; }
-extern "C" int mouse_right_pressed(void){ return mouse_btn_right; }
+extern "C" int mouse_is_ready(void)      { return mouse_ready; }
+extern "C" int mouse_get_x(void)         { return mouse_x; }
+extern "C" int mouse_get_y(void)         { return mouse_y; }
+extern "C" int mouse_left_pressed(void)  { return mouse_btn_left; }
+extern "C" int mouse_right_pressed(void) { return mouse_btn_right; }
