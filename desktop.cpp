@@ -18,12 +18,16 @@
 #define COLOR_CURSOR_FILL    0x00FFFFFF
 #define COLOR_CURSOR_BORDER  0x00000000
 
-#define COLOR_WIN_TITLEBAR   0x001A3A5C   // azul oscuro (igual que taskbar)
-#define COLOR_WIN_TITLE_FG   0x00FFFFFF   // blanco
-#define COLOR_WIN_BODY       0x00E0E0E0   // gris claro
-#define COLOR_WIN_BORDER     0x00000000   // negro
-#define COLOR_WIN_SHADOW     0x00404040   // gris oscuro
-#define COLOR_WIN_TEXT_FG    0x00000000   // negro (texto dentro)
+#define COLOR_WIN_TITLEBAR   0x001A3A5C
+#define COLOR_WIN_TITLE_FG   0x00FFFFFF
+#define COLOR_WIN_BODY       0x00E0E0E0
+#define COLOR_WIN_BORDER     0x00000000
+#define COLOR_WIN_SHADOW     0x00404040
+#define COLOR_WIN_TEXT_FG    0x00000000
+
+#define COLOR_BTN_CLOSE_BG   0x00C03030   // rojo
+#define COLOR_BTN_CLOSE_FG   0x00FFFFFF   // blanco
+#define COLOR_BTN_CLOSE_HOVER 0x00FF4040  // rojo claro (hover)
 
 // =====================================================================
 // Dimensiones
@@ -36,8 +40,11 @@
 
 #define TITLEBAR_H  24
 
+#define BTN_CLOSE_W  16
+#define BTN_CLOSE_H  16
+
 // =====================================================================
-// Bitmap del cursor: 0=transparente, 1=blanco, 2=negro
+// Bitmap del cursor
 // =====================================================================
 static const unsigned char cursor_bitmap[CURSOR_H][CURSOR_W] = {
     {2,0,0,0,0,0,0,0},
@@ -67,6 +74,7 @@ static int  win_w = 400;
 static int  win_h = 240;
 static const char *win_title = "Ventana 1";
 static const char *win_text  = "Hola Mundo";
+static int  win_visible = 1;   // 1 = visible, 0 = cerrada
 
 // Estado del arrastre
 static int dragging   = 0;
@@ -201,10 +209,48 @@ static void cursor_move(int nx, int ny) {
 }
 
 // =====================================================================
+// Botón cerrar
+// =====================================================================
+
+// Rectángulo del botón cerrar (esquina derecha de la barra de título)
+static void btn_close_rect(int *bx, int *by) {
+    *bx = win_x + win_w - BTN_CLOSE_W - 4;
+    *by = win_y + (TITLEBAR_H - BTN_CLOSE_H) / 2;
+}
+
+// Dibuja el botón cerrar. hover = 1 si el cursor está encima.
+static void btn_close_draw(int hover) {
+    int bx, by;
+    btn_close_rect(&bx, &by);
+
+    uint32_t bg = hover ? COLOR_BTN_CLOSE_HOVER : COLOR_BTN_CLOSE_BG;
+
+    // Fondo
+    gfx_fill_rect(bx, by, BTN_CLOSE_W, BTN_CLOSE_H, bg);
+
+    // X (dos diagonales)
+    for (int i = 0; i < BTN_CLOSE_W; i++) {
+        gfx_putpixel(bx + i, by + i, COLOR_BTN_CLOSE_FG);
+        gfx_putpixel(bx + i, by + BTN_CLOSE_H - 1 - i, COLOR_BTN_CLOSE_FG);
+    }
+}
+
+// ¿El punto (mx,my) está dentro del botón cerrar?
+static int point_in_btn_close(int mx, int my) {
+    if (!win_visible) return 0;
+    int bx, by;
+    btn_close_rect(&bx, &by);
+    return (mx >= bx && mx < bx + BTN_CLOSE_W &&
+            my >= by && my < by + BTN_CLOSE_H);
+}
+
+// =====================================================================
 // Ventana
 // =====================================================================
-static void window_draw(void) {
-    // Sombra desplazada 4 px
+static void window_draw(int mx, int my) {
+    if (!win_visible) return;
+
+    // Sombra
     gfx_fill_rect(win_x + 4, win_y + 4, win_w, win_h, COLOR_WIN_SHADOW);
 
     // Barra de título
@@ -216,24 +262,30 @@ static void window_draw(void) {
     gfx_fill_rect(win_x, win_y + TITLEBAR_H, win_w, win_h - TITLEBAR_H,
                   COLOR_WIN_BODY);
 
-    // Texto dentro de la ventana
+    // Texto
     gfx_draw_string(win_x + 16, win_y + TITLEBAR_H + 16, win_text,
                     COLOR_WIN_TEXT_FG, COLOR_WIN_BODY);
 
     // Borde
     gfx_draw_rect(win_x, win_y, win_w, win_h, COLOR_WIN_BORDER);
+
+    // Botón cerrar (con hover si el ratón está encima)
+    int hover = point_in_btn_close(mx, my);
+    btn_close_draw(hover);
 }
 
-// Punto (mx,my) dentro de la barra de título
+// Punto (mx,my) dentro de la barra de título (excluyendo el botón cerrar)
 static int point_in_titlebar(int mx, int my) {
+    if (!win_visible) return 0;
+    if (point_in_btn_close(mx, my)) return 0;   // el botón no arrastra
     return (mx >= win_x && mx < win_x + win_w &&
             my >= win_y && my < win_y + TITLEBAR_H);
 }
 
-// Redibuja todo: fondo + ventana + cursor (usado al arrastrar)
+// Redibuja todo: fondo + ventana + cursor
 static void redraw_all(int mx, int my) {
     draw_desktop_bg();
-    window_draw();
+    window_draw(mx, my);
 
     cursor_x = -1;
     cursor_y = -1;
@@ -259,21 +311,19 @@ void desktop_run(void) {
     int W = gfx_width();
     int H = gfx_height();
 
-    // Posición inicial del ratón
     int mx = mouse_get_x();
     int my = mouse_get_y();
 
-    // Dibujo inicial
     redraw_all(mx, my);
 
     unsigned int last_tick = pit_get_ticks();
     int last_left = 0;
+    int last_hover_close = 0;
 
     while (1) {
         char c = keyboard_getchar();
-        if (c == 27) break;   // ESC
+        if (c == 27) break;
 
-        // Reloj cada segundo
         unsigned int now = pit_get_ticks();
         if (now - last_tick >= 100) {
             last_tick = now;
@@ -287,14 +337,28 @@ void desktop_run(void) {
             int now_left = mouse_left_pressed();
             int click = (now_left && !last_left);
 
-            // Iniciar arrastre si el clic fue en la barra de título
-            if (click && point_in_titlebar(mx, my)) {
-                dragging   = 1;
-                drag_off_x = mx - win_x;
-                drag_off_y = my - win_y;
+            // Hover sobre el botón cerrar
+            int hover_close = point_in_btn_close(mx, my);
+            if (hover_close != last_hover_close) {
+                // Redibujar la ventana para reflejar el hover
+                redraw_all(mx, my);
+                last_hover_close = hover_close;
             }
 
-            // Soltar botón
+            if (click) {
+                if (hover_close) {
+                    // Cerrar ventana
+                    win_visible = 0;
+                    dragging = 0;
+                    redraw_all(mx, my);
+                } else if (point_in_titlebar(mx, my)) {
+                    // Iniciar arrastre
+                    dragging   = 1;
+                    drag_off_x = mx - win_x;
+                    drag_off_y = my - win_y;
+                }
+            }
+
             if (!now_left && dragging) {
                 dragging = 0;
             }
