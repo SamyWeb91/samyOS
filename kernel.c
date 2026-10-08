@@ -18,10 +18,10 @@
 #include "gfx.h"
 
 // Declarado en screen.cpp
- void screen_set_gfx_mode(void);
+void screen_set_gfx_mode(void);
 
 // =====================================================================
-// Workers
+// Worker threads (demo)
 // =====================================================================
 void worker1(void) {
     volatile unsigned int x = 0;
@@ -38,7 +38,7 @@ void worker2(void) {
 // =====================================================================
 extern "C" void kernel_main(void) {
     // =============================================================
-    // PASO 1: init básico
+    // PASO 1: init básico (SIN paging todavía, SIN heap todavía)
     // =============================================================
     idt_init();
     gdt_init();
@@ -46,12 +46,25 @@ extern "C" void kernel_main(void) {
     pic_remap();
     pit_init(100);
     keyboard_init();
-    heap_init();
+
+    // =============================================================
+    // PASO 2: paging ANTES que el heap
+    //
+    // paging_init mapea los primeros 128 MB (0x0 - 0x8000000).
+    // El heap (0x400000 - 0x1400000) cae dentro de esa zona.
+    // Sin este orden, heap_init escribiría en memoria no mapeada
+    // y en hardware real daría page fault.
+    // =============================================================
     paging_init();
     paging_enable_now();
 
     // =============================================================
-    // PASO 2: VBE + GFX
+    // PASO 3: heap AHORA, con paging ya activo
+    // =============================================================
+    heap_init();
+
+    // =============================================================
+    // PASO 4: VBE + GFX
     // =============================================================
     vbe_init();
 
@@ -59,17 +72,19 @@ extern "C" void kernel_main(void) {
         gfx_init();
         screen_set_gfx_mode();
 
-        kprintf("MiniOS v5.0 + VBE\n");
+        kprintf("MiniOS v6.10\n");
         kprintf("=================\n\n");
         kprintf("VBE: %ux%u %ubpp\n",
                 vbe_width(), vbe_height(), vbe_bpp());
         kprintf("FB:  %x  pitch=%u bytes\n",
                 vbe_fb_addr(), vbe_pitch());
         kprintf("\n");
+    } else {
+        kprintf("VBE no disponible, sigo en modo texto\n");
     }
 
     // =============================================================
-    // PASO 3: resto del init
+    // PASO 5: resto del init
     // =============================================================
     kprintf("IDT cargada\n");
     kprintf("GDT recargada\n");
@@ -77,21 +92,17 @@ extern "C" void kernel_main(void) {
     kprintf("PIC remapeado\n");
     kprintf("PIT a 100 Hz\n");
     kprintf("Teclado listo\n");
+    kprintf("Paging activado\n");
     kprintf("Heap inicializado\n");
-    kprintf("Paginacion activada\n");
 
-    // MMIO se mapea dinamicamente en ahci_get_abar (no lo usamos ahora)
     kprintf("MMIO: no mapeado (modo seguro, sin AHCI)\n");
 
     kprintf("\n");
     syscall_init();
-
     user_init();
 
     // =============================================================
     // AHCI + FS: DESHABILITADOS para modo seguro en hardware real
-    //
-    // Descomentar estas lineas para volver al modo normal con disco.
     // =============================================================
     kprintf("\n");
     kprintf("[MODO SEGURO] AHCI y FS deshabilitados (no se toca el disco)\n");

@@ -4,7 +4,7 @@
 static unsigned int page_directory[1024] __attribute__((aligned(4096)));
 static unsigned int page_table_0[1024]   __attribute__((aligned(4096)));
 
-#define PT_POOL_SIZE 16
+#define PT_POOL_SIZE 32   // 32 PTs = 128 MB mapeables
 static unsigned int pt_pool[PT_POOL_SIZE][1024] __attribute__((aligned(4096)));
 static int pt_pool_next = 0;
 
@@ -16,12 +16,38 @@ extern "C" void paging_init() {
         page_table_0[i]   = 0;
     }
 
-    // El kernel (0 - 4 MB) se mapea SIN PTE_USER.
-    // El user code NO puede acceder a esta zona.
-    for (int i = 0; i < 1024; i++) {
-        page_table_0[i] = (i * 0x1000) | PTE_PRESENT | PTE_RW;
+    // Mapear los primeros 128 MB de RAM linealmente (identidad).
+    // 128 MB = 32 page tables de 4 MB cada una.
+    // Cubre kernel + heap + backbuffer + espacio de sobra.
+    //
+    // IMPORTANTE: se mapea con PTE_PRESENT | PTE_RW, sin PTE_USER.
+    // El user code NO puede acceder a esta zona directamente.
+    // Si en el futuro quieres userland, usa paging_map con PTE_USER
+    // para las páginas concretas que necesites.
+
+    int PTs_needed = 32;   // 32 PTs * 4 MB = 128 MB
+    if (PTs_needed > PT_POOL_SIZE) PTs_needed = PT_POOL_SIZE;
+
+    for (int pt_i = 0; pt_i < PTs_needed; pt_i++) {
+        unsigned int *pt;
+        if (pt_i == 0) {
+            pt = page_table_0;
+        } else {
+            pt = pt_pool[pt_i];
+        }
+
+        // Cada entry cubre 4 KB. Base física = pt_i * 4 MB.
+        unsigned int base_phys = pt_i * 0x400000;
+
+        for (int i = 0; i < 1024; i++) {
+            pt[i] = (base_phys + i * 0x1000) | PTE_PRESENT | PTE_RW;
+        }
+
+        page_directory[pt_i] = ((unsigned int)pt) | PTE_PRESENT | PTE_RW;
     }
-    page_directory[0] = ((unsigned int)page_table_0) | PTE_PRESENT | PTE_RW;
+
+    kprintf("paging: %d MB mapeados (0x0 - 0x%x)\n",
+            PTs_needed * 4, PTs_needed * 0x400000);
 }
 
 extern "C" void paging_enable_now() {
@@ -38,24 +64,12 @@ extern "C" void paging_map(unsigned int virt, unsigned int phys, unsigned int fl
         unsigned int *new_pt = pt_pool[pt_pool_next++];
         for (int i = 0; i < 1024; i++) new_pt[i] = 0;
 
-        // >>> FIX: añadir PTE_USER al PDE también.
-        //
-        // En x86, para que una página sea accesible desde ring 3,
-        // TANTO el PDE como el PTE deben tener el bit U/S (PTE_USER).
-        // Si el PDE no lo tiene, el CPU da #PF (err=0x5) incluso
-        // si el PTE sí lo tiene.
-        //
-        // Como el PDE se comparte entre todas las páginas de un
-        // mismo rango de 4 MB, si mapeas con PTE_USER, el PDE
-        // también debe tenerlo.
         unsigned int pde_flags = PTE_PRESENT | PTE_RW;
         if (flags & PTE_USER) {
             pde_flags |= PTE_USER;
         }
         page_directory[pd_index] = ((unsigned int)new_pt) | pde_flags;
     } else {
-        // >>> Si el PDE ya existe, y estamos mapeando con PTE_USER,
-        //     asegurarse de que el PDE también tenga PTE_USER.
         if ((flags & PTE_USER) && !(page_directory[pd_index] & PTE_USER)) {
             page_directory[pd_index] |= PTE_USER;
         }
