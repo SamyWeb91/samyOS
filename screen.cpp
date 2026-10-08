@@ -2,6 +2,7 @@
 #include "gfx.h"
 #include "vbe.h"
 #include "pit.h"
+#include "terminal.h"
 #include <stdarg.h>
 #include <stdint.h>
 
@@ -33,16 +34,24 @@ static uint32_t gfx_bg = 0x00000000;
 #define GFX_MARGIN  4
 
 // =====================================================================
-// Cursor parpadeante (solo modo gráfico)
+// Redireccion a la terminal
 // =====================================================================
-#define CURSOR_BLINK_TICKS  50   // 100 Hz → 0.5 s
+static int use_terminal = 0;
+
+void screen_set_terminal_mode(int on) { use_terminal = on; }
+int  screen_get_terminal_mode(void)   { return use_terminal; }
+
+// =====================================================================
+// Cursor parpadeante (modo grafico a pantalla completa)
+// =====================================================================
+#define CURSOR_BLINK_TICKS  50
 
 static int          cursor_visible   = 1;
 static unsigned int cursor_last_tick = 0;
 
-// Dibuja un pequeño rectángulo en la base del cursor actual
 static void draw_cursor_gfx(uint32_t color) {
     if (!gfx_mode) return;
+    if (use_terminal) return;
     if (gfx_cursor_x <= 0) return;
     gfx_fill_rect(gfx_cursor_x, gfx_cursor_y + GFX_CHAR_H - 2,
                   GFX_CHAR_W, 2, color);
@@ -52,10 +61,9 @@ static void erase_cursor_gfx(void) {
     draw_cursor_gfx(gfx_bg);
 }
 
-// Actualiza el parpadeo según el timer.
-// Llamar periódicamente (desde shell_run o desde screen_putchar).
 static void update_cursor_blink(void) {
     if (!gfx_mode) return;
+    if (use_terminal) return;
 
     unsigned int now = pit_get_ticks();
     if (now - cursor_last_tick >= CURSOR_BLINK_TICKS) {
@@ -67,16 +75,15 @@ static void update_cursor_blink(void) {
     }
 }
 
-// Al mover el cursor: repintar el nuevo
 static void move_cursor_gfx(void) {
     if (!gfx_mode) return;
+    if (use_terminal) return;
     cursor_visible = 1;
     cursor_last_tick = pit_get_ticks();
     draw_cursor_gfx(gfx_fg);
 }
 
-// Expuesto a shell.cpp para el parpadeo en reposo
- void screen_blink_tick(void) {
+void screen_blink_tick(void) {
     update_cursor_blink();
 }
 
@@ -104,7 +111,7 @@ static void screen_scroll_vga(void) {
 }
 
 // =====================================================================
-// Scroll gráfico
+// Scroll grafico
 // =====================================================================
 static void screen_scroll_gfx(void) {
     if (gfx_cursor_y + GFX_CHAR_H <= gfx_height()) return;
@@ -140,9 +147,14 @@ void screen_set_colors(unsigned int fg, unsigned int bg) {
 }
 
 // =====================================================================
-// API pública
+// API publica
 // =====================================================================
 void screen_clear(void) {
+    if (use_terminal) {
+        terminal_clear();
+        return;
+    }
+
     if (gfx_mode) {
         gfx_clear(gfx_bg);
         gfx_cursor_x = GFX_MARGIN;
@@ -162,11 +174,14 @@ void screen_clear(void) {
 }
 
 void screen_putchar(char c) {
-    // Actualizar el parpadeo en cada llamada
+    if (use_terminal) {
+        terminal_putchar(c);
+        return;
+    }
+
     update_cursor_blink();
 
     if (gfx_mode) {
-        // Borrar el cursor antes de escribir
         erase_cursor_gfx();
 
         if (c == '\n') {
@@ -176,12 +191,12 @@ void screen_putchar(char c) {
                 screen_scroll_gfx();
             }
             move_cursor_gfx();
-            return;
+            goto flip;
         }
         if (c == '\r') {
             gfx_cursor_x = GFX_MARGIN;
             move_cursor_gfx();
-            return;
+            goto flip;
         }
         if (c == '\b') {
             if (gfx_cursor_x > GFX_MARGIN) {
@@ -190,7 +205,7 @@ void screen_putchar(char c) {
                               GFX_CHAR_W, GFX_CHAR_H, gfx_bg);
             }
             move_cursor_gfx();
-            return;
+            goto flip;
         }
 
         gfx_draw_char(gfx_cursor_x, gfx_cursor_y, c, gfx_fg, gfx_bg);
@@ -204,6 +219,11 @@ void screen_putchar(char c) {
             }
         }
         move_cursor_gfx();
+
+    flip:
+        if (gfx_backbuffer_active()) {
+            gfx_backbuffer_flip();
+        }
         return;
     }
 

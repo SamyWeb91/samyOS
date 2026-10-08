@@ -269,7 +269,7 @@ static void cmd_mem() {
     kprintf("Entradas E820: %u\n", num);
     unsigned long long total_usable = 0;
 
-    volatile E820Entry *entries = (volatile E820Entry*)0x5004;
+    volatile E820Entry *entries = (volatile E820Entry*)0x5008;
     for (unsigned int i = 0; i < num; i++) {
         unsigned long long base = entries[i].base;
         unsigned long long len  = entries[i].length;
@@ -997,36 +997,49 @@ static void execute(const char *l) {
 }
 
 // =====================================================================
-// Bucle de la shell
+// Procesar UNA tecla (para el modo terminal dentro del desktop)
+// =====================================================================
+void shell_handle_key(char c) {
+    if (c == '\n') {
+        screen_putchar('\n');
+        line[line_len] = 0;
+        execute(line);
+        line_len = 0;
+        kprintf("> ");
+    } else if (c == '\b') {
+        if (line_len > 0) {
+            line_len--;
+            screen_putchar('\b');
+        }
+    } else if (c >= 32 && c < 127) {
+        if (line_len < LINE_MAX - 1) {
+            line[line_len++] = c;
+            screen_putchar(c);
+        }
+    }
+}
+
+// =====================================================================
+// Inicializacion (imprime el prompt inicial)
+// =====================================================================
+void shell_init(void) {
+    line_len = 0;
+    kprintf("> ");
+}
+
+// =====================================================================
+// Bucle de la shell (modo pantalla completa, arranque)
 // =====================================================================
 void shell_run() {
-    kprintf("> ");
-    line_len = 0;
+    shell_init();
 
     while (1) {
         char c = keyboard_getchar();
         if (!c) {
-            screen_blink_tick();   // ← NUEVO: hace parpadear el cursor
+            screen_blink_tick();
             thread_yield();
             continue;
         }
-
-        if (c == '\n') {
-            screen_putchar('\n');
-            line[line_len] = 0;
-            execute(line);
-            line_len = 0;
-            kprintf("> ");
-        } else if (c == '\b') {
-            if (line_len > 0) {
-                line_len--;
-                screen_putchar('\b');
-            }
-        } else if (c >= 32 && c < 127) {
-            if (line_len < LINE_MAX - 1) {
-                line[line_len++] = c;
-                screen_putchar(c);
-            }
-        }
+        shell_handle_key(c);
     }
 }
