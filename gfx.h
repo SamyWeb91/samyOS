@@ -45,12 +45,11 @@ int gfx_bpp(void);
 // Primitivas
 // =====================================================================
 void gfx_putpixel(int x, int y, uint32_t color);
-uint32_t gfx_getpixel(int x, int y);                       // ← NUEVO
+uint32_t gfx_getpixel(int x, int y);
 void gfx_fill_rect(int x, int y, int w, int h, uint32_t color);
 void gfx_clear(uint32_t color);
 void gfx_draw_rect(int x, int y, int w, int h, uint32_t color);
 
-// Copiar una región del framebuffer (útil para scroll)
 void gfx_copy_rect(int src_x, int src_y, int dst_x, int dst_y, int w, int h);
 
 // =====================================================================
@@ -58,6 +57,15 @@ void gfx_copy_rect(int src_x, int src_y, int dst_x, int dst_y, int w, int h);
 // =====================================================================
 void gfx_draw_char(int x, int y, char c, uint32_t fg, uint32_t bg);
 void gfx_draw_string(int x, int y, const char *s, uint32_t fg, uint32_t bg);
+
+// =====================================================================
+// Doble buffer
+// =====================================================================
+int  gfx_backbuffer_init(void);
+int  gfx_backbuffer_active(void);
+void gfx_backbuffer_flip(void);
+void gfx_backbuffer_flip_region(int rx, int ry, int rw, int rh);
+void gfx_backbuffer_free(void);
 
 #ifdef __cplusplus
 }

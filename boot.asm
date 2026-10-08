@@ -1,5 +1,5 @@
 ; =====================================================================
-; Bootloader mínimo: VBE + GDT + carga kernel
+; Bootloader: E820 + VBE + GDT + carga kernel
 ; =====================================================================
 format binary
 use16
@@ -9,7 +9,7 @@ start:
     jmp short boot_start
     nop
 
-; --- BPB (obligatorio para que la BIOS reconozca el disco) ---
+; --- BPB ---
 bpbOEM          db "MINIOS  "
 bpbBytesPerSec  dw 512
 bpbSecPerClus   db 1
@@ -42,7 +42,10 @@ boot_start:
 
     mov [boot_drive], dl
 
-    ; Cargar kernel: 96 sectores desde LBA 1 a 0x10000
+    ; ---- E820: capturar mapa de memoria ----
+    call e820_capture
+
+    ; Cargar kernel: 128 sectores desde LBA 1 a 0x10000
     mov ax, 0x1000
     mov es, ax
     xor bx, bx
@@ -67,6 +70,42 @@ boot_start:
     jmp 0x08:pm_start
 
 ; =====================================================================
+; e820_capture
+;   Guarda:
+;     0x5000: numero de entradas (u32)
+;     0x5004: signature 0xE820E820 (u32)
+;     0x5008: entradas (24 bytes cada una)
+; =====================================================================
+e820_capture:
+    pusha
+
+    xor ax, ax
+    mov es, ax
+    mov di, 0x5008          ; destino de las entradas
+    xor ebx, ebx
+    xor bp, bp              ; contador
+.loop:
+    mov eax, 0xE820
+    mov edx, 0x534D4150     ; "SMAP"
+    mov ecx, 24
+    int 0x15
+    jc .done
+    cmp eax, 0x534D4150
+    jne .done
+    test ebx, ebx
+    jz .done
+    add di, 24
+    inc bp
+    cmp bp, 32
+    jae .done
+    jmp .loop
+.done:
+    mov [0x5000], bp
+    mov dword [0x5004], 0xE820E820
+    popa
+    ret
+
+; =====================================================================
 ; vbe_setup
 ;
 ; Prueba varios modos. Guarda info en 0x6000.
@@ -82,7 +121,6 @@ vbe_setup:
 
     mov dword [0x6000], 0
 
-    ; Consultar VBE info
     mov ax, 0x0000
     mov es, ax
     mov di, 0x6100
@@ -97,23 +135,15 @@ vbe_setup:
     cmp ax, 0x004F
     jne .done
 
-    ; Probar modo 1024x768x32
-    mov cx, 0x011B
+    mov cx, 0x011B          ; 1024x768x32
     call vbe_try
     jnc .done
 
-    ; Probar modo 1024x768x24
-    mov cx, 0x0118
+    mov cx, 0x0118          ; 1024x768x24
     call vbe_try
     jnc .done
 
-    ; Probar modo 640x480x32
-    mov cx, 0x0112
-    call vbe_try
-    jnc .done
-
-    ; Probar modo 640x480x8
-    mov cx, 0x0101
+    mov cx, 0x0112          ; 640x480x32
     call vbe_try
     jnc .done
 
@@ -143,13 +173,11 @@ vbe_try:
     cmp ax, 0x004F
     jne .fail
 
-    ; Verificar ModeAttributes (supported + LFB)
     mov ax, [0x6200]
     and ax, 0x0081
     cmp ax, 0x0081
     jne .fail
 
-    ; Cambiar al modo
     mov cx, [0x6300]
     mov bx, cx
     or bx, 0x4000
@@ -158,7 +186,6 @@ vbe_try:
     cmp ax, 0x004F
     jne .fail
 
-    ; Guardar info
     mov ax, [0x6212]
     mov [0x600A], ax
     mov ax, [0x6214]

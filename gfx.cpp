@@ -10,7 +10,7 @@ extern "C" uint8_t font8x16[256][16];
 // =====================================================================
 // Estado del driver
 // =====================================================================
-static uint8_t *fb          = 0;   // framebuffer real (VBE)
+static uint8_t *fb          = 0;
 static int      fb_w        = 0;
 static int      fb_h        = 0;
 static int      fb_pitch    = 0;
@@ -45,16 +45,10 @@ static inline uint32_t getpixel_at(const uint8_t *p) {
     return (r << 16) | (g << 8) | b;
 }
 
-// Convertir 0x00RRGGBB a formato nativo del framebuffer (BGRA en LE)
 static inline uint32_t pack_to_fb(uint32_t c) {
-    // c = 0x00RRGGBB
-    // resultado en memoria: [B, G, R, X] → 0x00RRGGBB se escribe como
-    // uint32_t: (R<<16) | (G<<8) | B ... pero en LE se lee byte 0 = B.
-    // Para escribir uint32_t de golpe y que en memoria quede B,G,R,X:
-    // uint32_t en LE = B | (G<<8) | (R<<16) | (0<<24)
-    return ((c & 0x000000FF)      ) |   // B → byte 0
-           ((c & 0x0000FF00)      ) |   // G → byte 1
-           ((c & 0x00FF0000)      ) |   // R → byte 2
+    return ((c & 0x000000FF)      ) |
+           ((c & 0x0000FF00)      ) |
+           ((c & 0x00FF0000)      ) |
            (0u);
 }
 
@@ -279,7 +273,6 @@ extern "C" int gfx_backbuffer_init(void) {
         return 0;
     }
 
-    // Sanity check: escribir primer y último uint32_t
     volatile uint32_t *test = bb;
     test[0] = 0;
     test[bytes / 4 - 1] = 0;
@@ -319,14 +312,6 @@ extern "C" void gfx_backbuffer_flip(void) {
     }
 }
 
-// =====================================================================
-// Flip de una región: versión OPTIMIZADA
-//
-// En fb_bpp == 32 escribe 32 bits de golpe (1 escritura por píxel).
-// En fb_bpp == 24, escribe 3 bytes (no hay otra).
-//
-// Esto elimina el cuelgue aparente al arrastrar/cerrar ventanas.
-// =====================================================================
 extern "C" void gfx_backbuffer_flip_region(int rx, int ry, int rw, int rh) {
     if (!fb || !bb) return;
 
@@ -340,7 +325,6 @@ extern "C" void gfx_backbuffer_flip_region(int rx, int ry, int rw, int rh) {
     if (rw <= 0 || rh <= 0) return;
 
     if (fb_bpp == 32) {
-        // Camino rápido: 32 bits por píxel
         for (int y = ry; y < ry + rh; y++) {
             uint32_t *src = bb + (uint32_t)y * bb_w + rx;
             uint32_t *dst = (uint32_t *)(fb + (uint32_t)y * fb_pitch) + rx;
