@@ -42,6 +42,14 @@ void screen_set_terminal_mode(int on) { use_terminal = on; }
 int  screen_get_terminal_mode(void)   { return use_terminal; }
 
 // =====================================================================
+// Optimizacion del arranque:
+// no hacer flip por cada caracter (3 MB de copia cada vez).
+// Hacerlo cada N caracteres, y un flip completo al final.
+// =====================================================================
+#define FLIP_EVERY_N_CHARS  64
+static int chars_since_flip = 0;
+
+// =====================================================================
 // Cursor parpadeante (modo grafico a pantalla completa)
 // =====================================================================
 #define CURSOR_BLINK_TICKS  50
@@ -221,8 +229,12 @@ void screen_putchar(char c) {
         move_cursor_gfx();
 
     flip:
-        if (gfx_backbuffer_active()) {
-            gfx_backbuffer_flip();
+        chars_since_flip++;
+        if (chars_since_flip >= FLIP_EVERY_N_CHARS) {
+            chars_since_flip = 0;
+            if (gfx_backbuffer_active()) {
+                gfx_backbuffer_flip();
+            }
         }
         return;
     }

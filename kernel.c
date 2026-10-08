@@ -1,3 +1,4 @@
+// kernel.c
 #include "screen.h"
 #include "idt.h"
 #include "gdt.h"
@@ -38,7 +39,7 @@ void worker2(void) {
 // =====================================================================
 extern "C" void kernel_main(void) {
     // =============================================================
-    // PASO 1: init básico (SIN paging todavía, SIN heap todavía)
+    // PASO 1: init básico
     // =============================================================
     idt_init();
     gdt_init();
@@ -49,30 +50,36 @@ extern "C" void kernel_main(void) {
 
     // =============================================================
     // PASO 2: paging ANTES que el heap
-    //
-    // paging_init mapea los primeros 128 MB (0x0 - 0x8000000).
-    // El heap (0x400000 - 0x1400000) cae dentro de esa zona.
-    // Sin este orden, heap_init escribiría en memoria no mapeada
-    // y en hardware real daría page fault.
     // =============================================================
     paging_init();
     paging_enable_now();
 
     // =============================================================
-    // PASO 3: heap AHORA, con paging ya activo
+    // PASO 3: heap
     // =============================================================
     heap_init();
 
     // =============================================================
-    // PASO 4: VBE + GFX
+    // PASO 4: VBE + GFX + Backbuffer
     // =============================================================
     vbe_init();
 
     if (vbe_available()) {
         gfx_init();
+
+        // Inicializar el backbuffer ANTES de cualquier kprintf.
+        gfx_backbuffer_init();
+
+        // Limpiar el backbuffer a negro
+        gfx_clear(0x00000000);
+
+        // Volcar el backbuffer limpio al framebuffer de una vez.
+        // Esto limpia TODA la basura inicial (incluido el padding).
+        gfx_backbuffer_flip();
+
         screen_set_gfx_mode();
 
-        kprintf("MiniOS v6.10\n");
+        kprintf("MiniOS v7.0\n");
         kprintf("=================\n\n");
         kprintf("VBE: %ux%u %ubpp\n",
                 vbe_width(), vbe_height(), vbe_bpp());
@@ -101,19 +108,8 @@ extern "C" void kernel_main(void) {
     syscall_init();
     user_init();
 
-    // =============================================================
-    // AHCI + FS: DESHABILITADOS para modo seguro en hardware real
-    // =============================================================
     kprintf("\n");
     kprintf("[MODO SEGURO] AHCI y FS deshabilitados (no se toca el disco)\n");
-
-    // if (ahci_init()) {
-    //     kprintf("AHCI listo\n");
-    // } else {
-    //     kprintf("AHCI no disponible\n");
-    // }
-    //
-    // fs_init();
 
     kprintf("\n");
     thread_init();
@@ -123,10 +119,25 @@ extern "C" void kernel_main(void) {
 
     kprintf("Threads listos\n");
 
+    // =============================================================
+    // Activar IRQs ANTES del flip final.
+    // =============================================================
     asm volatile("sti");
 
     kprintf("\nEscribe 'help' para ver los comandos.\n\n");
 
+    // =============================================================
+    // FLIP FINAL: volcar todo el backbuffer al framebuffer.
+    // Se hace DESPUES de sti, para que las IRQs no se queden
+    // bloqueadas mientras dura el flip.
+    // =============================================================
+    if (gfx_backbuffer_active()) {
+        gfx_backbuffer_flip();
+    }
+
+    // =============================================================
+    // Shell: bucle principal
+    // =============================================================
     shell_run();
 
     while (1) {}

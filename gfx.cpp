@@ -76,13 +76,15 @@ extern "C" void gfx_init(void) {
         return;
     }
 
-    uint32_t size_mb = (fb_pitch * fb_h + 0xFFFFF) / 0x100000 + 1;
-    paging_map_range(addr, addr, size_mb * 1024, PTE_PRESENT | PTE_RW);
+    // Mapear TODO el framebuffer: pitch * height, redondeado a KB
+    uint32_t total_bytes = (uint32_t)fb_pitch * (uint32_t)fb_h;
+    uint32_t size_kb = (total_bytes + 0xFFF) / 0x400 + 1;
+    paging_map_range(addr, addr, size_kb, PTE_PRESENT | PTE_RW);
 
     fb = (uint8_t *)addr;
 
-    kprintf("gfx: %dx%d %ubpp pitch=%u bytes fb=%x (mapeado %u MB)\n",
-            fb_w, fb_h, fb_bpp, fb_pitch, addr, size_mb);
+    kprintf("gfx: %dx%d %ubpp pitch=%u bytes fb=%x (mapeado %u KB)\n",
+            fb_w, fb_h, fb_bpp, fb_pitch, addr, size_kb);
 }
 
 extern "C" int gfx_ready(void)      { return fb != 0; }
@@ -147,8 +149,37 @@ extern "C" void gfx_fill_rect(int x, int y, int w, int h, uint32_t color) {
     }
 }
 
+// Limpiar TODO el framebuffer, incluyendo el padding de cada linea
 extern "C" void gfx_clear(uint32_t color) {
-    gfx_fill_rect(0, 0, fb_w, fb_h, color);
+    if (bb) {
+        // El backbuffer no tiene padding
+        for (int y = 0; y < bb_h; y++) {
+            uint32_t *p = bb + (uint32_t)y * bb_w;
+            for (int x = 0; x < bb_w; x++) p[x] = color;
+        }
+        return;
+    }
+
+    if (!fb) return;
+
+    // Sin backbuffer: limpiar TODO el framebuffer (fb_pitch * fb_h)
+    for (int y = 0; y < fb_h; y++) {
+        uint8_t *p = fb + (uint32_t)y * fb_pitch;
+
+        if (fb_bpp == 32) {
+            uint32_t *p32 = (uint32_t *)p;
+            uint32_t n = (uint32_t)fb_pitch / 4;
+            uint32_t c = pack_to_fb(color);
+            for (uint32_t x = 0; x < n; x++) p32[x] = c;
+        } else if (fb_bpp == 24) {
+            uint32_t n = (uint32_t)fb_pitch / 3;
+            for (uint32_t x = 0; x < n; x++) {
+                p[x*3 + 0] = (color      ) & 0xFF;
+                p[x*3 + 1] = (color >>  8) & 0xFF;
+                p[x*3 + 2] = (color >> 16) & 0xFF;
+            }
+        }
+    }
 }
 
 // =====================================================================
@@ -289,6 +320,8 @@ extern "C" int gfx_backbuffer_active(void) {
     return bb != 0;
 }
 
+// Flip COMPLETO: copia el backbuffer al framebuffer real.
+// Tambien limpia el padding de cada linea (si fb_pitch > fb_w*bpp/8).
 extern "C" void gfx_backbuffer_flip(void) {
     if (!fb || !bb) return;
 
@@ -301,12 +334,21 @@ extern "C" void gfx_backbuffer_flip(void) {
             for (int x = 0; x < fb_w; x++) {
                 d32[x] = pack_to_fb(src[x]);
             }
+            // Rellenar el padding de la linea con negro
+            uint32_t n = (uint32_t)fb_pitch / 4;
+            for (uint32_t x = (uint32_t)fb_w; x < n; x++) d32[x] = 0;
         } else if (fb_bpp == 24) {
             for (int x = 0; x < fb_w; x++) {
                 uint32_t c = src[x];
                 dst[x*3 + 0] = (c      ) & 0xFF;
                 dst[x*3 + 1] = (c >>  8) & 0xFF;
                 dst[x*3 + 2] = (c >> 16) & 0xFF;
+            }
+            uint32_t n = (uint32_t)fb_pitch / 3;
+            for (uint32_t x = (uint32_t)fb_w; x < n; x++) {
+                dst[x*3 + 0] = 0;
+                dst[x*3 + 1] = 0;
+                dst[x*3 + 2] = 0;
             }
         }
     }
