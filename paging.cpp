@@ -4,7 +4,7 @@
 static unsigned int page_directory[1024] __attribute__((aligned(4096)));
 static unsigned int page_table_0[1024]   __attribute__((aligned(4096)));
 
-#define PT_POOL_SIZE 32   // 32 PTs = 128 MB mapeables
+#define PT_POOL_SIZE 64   // 32 PTs = 128 MB mapeables
 static unsigned int pt_pool[PT_POOL_SIZE][1024] __attribute__((aligned(4096)));
 static int pt_pool_next = 0;
 
