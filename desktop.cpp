@@ -280,8 +280,10 @@ void desktop_run(void) {
     g_term_window_id = window_create(100, 80, 700, 450,
                                       "C:\\> MiniOS Terminal");
 
+    // 3. Inicializar el estado del terminal (buffer a espacios, cursor a 0)
     terminal_init_state(&g_term_state);
 
+    // 4. Añadir el widget terminal a la ventana
     window_add_terminal(g_term_window_id,
                         0, 0,
                         700 - WIN_PADDING * 2,
@@ -290,13 +292,20 @@ void desktop_run(void) {
 
     window_set_focus(g_term_window_id);
 
-    // 3. Activar redireccion de kprintf -> terminal
+    // 5. Activar redireccion de kprintf -> terminal
+    //    A partir de aqui, todo lo que se imprima con kprintf va al
+    //    buffer del terminal en vez de dibujarse directamente.
     screen_set_terminal_mode(1);
 
-    // 4. Arrancar la shell: imprime "> " en la terminal
+    // 6. Arrancar la shell: imprime "> " en el buffer del terminal
     shell_init();
 
-    // 5. Primer frame
+    // 7. Primer frame: dibujar todo (fondo + ventana + terminal + cursor)
+    dirty_all();
+    apply_dirty(mx, my);
+
+    // 8. Segundo frame: por si el shell_init escribio algo despues del
+    //    primer apply_dirty, redibujar todo una vez mas.
     dirty_all();
     apply_dirty(mx, my);
 
