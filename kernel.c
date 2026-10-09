@@ -17,22 +17,9 @@
 #include "user.h"
 #include "vbe.h"
 #include "gfx.h"
-
+#include "desktop.h"
 // Declarado en screen.cpp
 void screen_set_gfx_mode(void);
-
-// =====================================================================
-// Worker threads (demo)
-// =====================================================================
-void worker1(void) {
-    volatile unsigned int x = 0;
-    while (1) { x++; }
-}
-
-void worker2(void) {
-    volatile unsigned int y = 0;
-    while (1) { y++; }
-}
 
 // =====================================================================
 // kernel_main
@@ -74,12 +61,11 @@ extern "C" void kernel_main(void) {
         gfx_clear(0x00000000);
 
         // Volcar el backbuffer limpio al framebuffer de una vez.
-        // Esto limpia TODA la basura inicial (incluido el padding).
         gfx_backbuffer_flip();
 
         screen_set_gfx_mode();
 
-        kprintf("MiniOS v7.0\n");
+        kprintf("MiniOS v7.1\n");
         kprintf("=================\n\n");
         kprintf("VBE: %ux%u %ubpp\n",
                 vbe_width(), vbe_height(), vbe_bpp());
@@ -114,9 +100,6 @@ extern "C" void kernel_main(void) {
     kprintf("\n");
     thread_init();
 
-    thread_create("worker1", worker1);
-    thread_create("worker2", worker2);
-
     kprintf("Threads listos\n");
 
     // =============================================================
@@ -128,8 +111,6 @@ extern "C" void kernel_main(void) {
 
     // =============================================================
     // FLIP FINAL: volcar todo el backbuffer al framebuffer.
-    // Se hace DESPUES de sti, para que las IRQs no se queden
-    // bloqueadas mientras dura el flip.
     // =============================================================
     if (gfx_backbuffer_active()) {
         gfx_backbuffer_flip();
@@ -138,7 +119,7 @@ extern "C" void kernel_main(void) {
     // =============================================================
     // Shell: bucle principal
     // =============================================================
-    shell_run();
+    desktop_run();
 
     while (1) {}
 }

@@ -78,7 +78,6 @@ static void cmd_help() {
     screen_write("  load <n> <lba> - copiar 4 KB del LBA al FS como <n>\n");
     screen_write("  run <archivo> - ejecutar archivo del FS en ring 3\n");
     screen_write("  ring3         - lanzar proceso de prueba en ring 3\n");
-    screen_write("  desktop       - escritorio grafico simple\n");
     screen_write("  ps            - listar procesos\n");
     screen_write("  kill <pid>    - terminar proceso\n");
     screen_write("  reboot        - reiniciar el PC\n");
@@ -111,9 +110,7 @@ static void cmd_echo(const char *args) {
 // =====================================================================
 // Escritorio
 // =====================================================================
-static void cmd_desktop() {
-    desktop_run();
-}
+
 
 // =====================================================================
 // TSS info
@@ -964,7 +961,6 @@ static void execute(const char *l) {
     else if (str_eq(l, "test"))         cmd_test();
     else if (str_eq(l, "tssinfo"))      cmd_tssinfo();
     else if (str_eq(l, "ring3"))        cmd_ring3();
-    else if (str_eq(l, "desktop"))      cmd_desktop();
     else if (str_eq(l, "ls"))           cmd_ls();
     else if (str_eq(l, "df"))           cmd_df();
     else if (str_eq(l, "diskinfo"))     cmd_diskinfo();
