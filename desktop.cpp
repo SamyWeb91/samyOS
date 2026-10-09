@@ -50,12 +50,11 @@ static const unsigned char cursor_bitmap[CURSOR_H][CURSOR_W] = {
 };
 
 // =====================================================================
-// Estado del terminal (uno solo, dentro de la ventana terminal)
+// Estado del terminal
 // =====================================================================
 static struct TerminalState g_term_state;
 static int g_term_window_id = -1;
 
-// Estado de arrastre de ventanas
 static int drag_window_id = -1;
 static int drag_off_x = 0;
 static int drag_off_y = 0;
@@ -99,7 +98,6 @@ static void dirty_all(void) {
     dirty_w = gfx_width(); dirty_h = gfx_height();
 }
 
-// Marcar toda la zona de una ventana como sucia
 static void dirty_window(int win_id) {
     if (win_id < 0) return;
     int x, y, w, h;
@@ -139,15 +137,6 @@ static void draw_clock(void) {
     gfx_fill_rect(x - 4, H - TASKBAR_HEIGHT + 1,
                   8 * 8 + 8, TASKBAR_HEIGHT - 1, COLOR_TASKBAR_BG);
     gfx_draw_string(x, y, buf, COLOR_TASKBAR_TEXT, COLOR_TASKBAR_BG);
-}
-
-static void clock_rect(int *x, int *y, int *w, int *h) {
-    int W = gfx_width();
-    int H = gfx_height();
-    *x = W - CLOCK_RIGHT - 8 * 8 - 4;
-    *y = H - TASKBAR_HEIGHT + 1;
-    *w = 8 * 8 + 8;
-    *h = TASKBAR_HEIGHT - 1;
 }
 
 // =====================================================================
@@ -197,7 +186,7 @@ static void redraw_region(int rx, int ry, int rw, int rh, int mx, int my) {
                         0x00FFFFFF, COLOR_DESKTOP_BG);
     }
 
-    // 3. Taskbar
+    // 3. Taskbar + reloj (si la región toca la barra)
     if (ry + rh > H - TASKBAR_HEIGHT) {
         draw_taskbar();
         draw_clock();
@@ -244,7 +233,7 @@ static void apply_dirty(int mx, int my) {
 }
 
 // =====================================================================
-// Callbacks para screen.cpp (redireccion de kprintf -> terminal)
+// Callbacks para screen.cpp
 // =====================================================================
 void desktop_terminal_putchar(char c) {
     terminal_putchar_state(&g_term_state, c);
@@ -273,17 +262,15 @@ void desktop_run(void) {
     int mx = mouse_get_x();
     int my = mouse_get_y();
 
-    // 1. Inicializar el sistema de ventanas
+    // 1. Sistema de ventanas
     window_system_init();
 
-    // 2. Crear la ventana terminal
+    // 2. Crear ventana terminal
     g_term_window_id = window_create(100, 80, 700, 450,
                                       "C:\\> MiniOS Terminal");
 
-    // 3. Inicializar el estado del terminal (buffer a espacios, cursor a 0)
     terminal_init_state(&g_term_state);
 
-    // 4. Añadir el widget terminal a la ventana
     window_add_terminal(g_term_window_id,
                         0, 0,
                         700 - WIN_PADDING * 2,
@@ -292,20 +279,17 @@ void desktop_run(void) {
 
     window_set_focus(g_term_window_id);
 
-    // 5. Activar redireccion de kprintf -> terminal
-    //    A partir de aqui, todo lo que se imprima con kprintf va al
-    //    buffer del terminal en vez de dibujarse directamente.
+    // 3. Redirigir kprintf al terminal
     screen_set_terminal_mode(1);
 
-    // 6. Arrancar la shell: imprime "> " en el buffer del terminal
+    // 4. Arrancar la shell: imprime "> " en el buffer del terminal
     shell_init();
 
-    // 7. Primer frame: dibujar todo (fondo + ventana + terminal + cursor)
+    // 5. Primer frame
     dirty_all();
     apply_dirty(mx, my);
 
-    // 8. Segundo frame: por si el shell_init escribio algo despues del
-    //    primer apply_dirty, redibujar todo una vez mas.
+    // 6. Segundo frame: por si el shell_init escribio algo
     dirty_all();
     apply_dirty(mx, my);
 
@@ -319,12 +303,21 @@ void desktop_run(void) {
         char c = keyboard_getchar();
         if (c) {
             int focused_win = window_get_focused();
+            int consumed = 0;
+
             if (focused_win >= 0) {
-                if (window_handle_key(focused_win, c)) {
+                consumed = window_handle_key(focused_win, c);
+                if (consumed) {
                     dirty_window(focused_win);
                 }
-            } else {
+            }
+
+            // Si la ventana no consume la tecla, darsela a la shell
+            // directamente (la shell redirige con screen_putchar).
+            if (!consumed) {
                 shell_handle_key(c);
+
+                // Marcar el terminal como sucio para que se redibuje
                 dirty_window(g_term_window_id);
             }
         }
@@ -336,10 +329,12 @@ void desktop_run(void) {
         if (now - last_tick >= 100) {
             last_tick = now;
 
-            int cx, cy, cw, ch;
-            clock_rect(&cx, &cy, &cw, &ch);
-            dirty_union(cx, cy, cw, ch);
+            // Reloj: marcar TODO el area de la taskbar
+            int H = gfx_height();
+            int W = gfx_width();
+            dirty_union(0, H - TASKBAR_HEIGHT, W, TASKBAR_HEIGHT);
 
+            // Parpadeo del cursor del terminal
             terminal_blink_state(&g_term_state);
             dirty_window(g_term_window_id);
         }
@@ -372,7 +367,7 @@ void desktop_run(void) {
                 if (win_id >= 0) {
                     if (window_point_in_close(win_id, mx, my)) {
                         window_hide(win_id);
-                        dirty_window(win_id);
+                        dirty_all();
                     } else if (window_point_in_titlebar(win_id, mx, my)) {
                         drag_window_id = win_id;
                         int wx, wy;
