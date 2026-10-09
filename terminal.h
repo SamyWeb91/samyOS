@@ -6,37 +6,40 @@
 extern "C" {
 #endif
 
-#define TERM_WIN_W  700
-#define TERM_WIN_H  450
-
 #define TERM_COLS   80
 #define TERM_ROWS   24
 
-void terminal_init(int x, int y, int w, int h);
-void terminal_set_pos(int x, int y);
-void terminal_get_rect(int *x, int *y, int *w, int *h);
+// =====================================================================
+// Estado interno del terminal (buffer + cursor)
+// Se pasa como puntero a window_add_terminal para que cada ventana
+// terminal pueda tener su propio buffer.
+// =====================================================================
+struct TerminalState {
+    char term_buf[TERM_ROWS][TERM_COLS];
+    int  term_cx;
+    int  term_cy;
 
-void terminal_clear(void);
-void terminal_putchar(char c);
-void terminal_puts(const char *s);
+    int  cursor_visible;
+    unsigned int cursor_last_tick;
 
-void terminal_draw(void);
+    int  has_focus;
+};
 
-void terminal_set_focus(int focus);
-int  terminal_get_focus(void);
+// =====================================================================
+// Ciclo de vida
+// =====================================================================
+void terminal_init_state(struct TerminalState *s);
+void terminal_clear_state(struct TerminalState *s);
 
-void terminal_blink_tick(void);
+void terminal_putchar_state(struct TerminalState *s, char c);
+void terminal_puts_state(struct TerminalState *s, const char *str);
 
-// Boton cerrar
-int  terminal_point_in_close(int mx, int my);
-void terminal_close(void);
-int  terminal_is_visible(void);
+// Dibuja el contenido del estado en un rectangulo dado (coords absolutas).
+void terminal_draw_in_rect(struct TerminalState *s, int x, int y, int w, int h);
 
-// Arrastrar
-int  terminal_point_in_titlebar(int mx, int my);
-
-// Redireccion de teclado (ya NO se usa, se deja por compatibilidad)
-int  terminal_handle_key(char c);
+// Parpadeo
+void terminal_blink_state(struct TerminalState *s);
+void terminal_set_focus_state(struct TerminalState *s, int focus);
 
 #ifdef __cplusplus
 }

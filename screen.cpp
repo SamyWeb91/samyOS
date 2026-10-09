@@ -7,6 +7,13 @@
 #include <stdint.h>
 
 // =====================================================================
+// Funciones que el desktop implementa para redirigir la salida.
+// Si el desktop no esta activo, use_terminal == 0 y no se llaman.
+// =====================================================================
+extern "C" void desktop_terminal_putchar(char c);
+extern "C" void desktop_terminal_clear(void);
+
+// =====================================================================
 // Buffer VGA (modo texto) — solo si no hay VBE
 // =====================================================================
 #define VGA_MEM    ((volatile uint16_t *)0xB8000)
@@ -159,7 +166,7 @@ void screen_set_colors(unsigned int fg, unsigned int bg) {
 // =====================================================================
 void screen_clear(void) {
     if (use_terminal) {
-        terminal_clear();
+        desktop_terminal_clear();
         return;
     }
 
@@ -183,7 +190,7 @@ void screen_clear(void) {
 
 void screen_putchar(char c) {
     if (use_terminal) {
-        terminal_putchar(c);
+        desktop_terminal_putchar(c);
         return;
     }
 

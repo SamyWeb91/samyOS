@@ -8,6 +8,8 @@
 #include "mouse.h"
 #include "terminal.h"
 #include "shell.h"
+#include "window.h"
+#include "widget.h"
 
 // =====================================================================
 // Colores
@@ -48,15 +50,15 @@ static const unsigned char cursor_bitmap[CURSOR_H][CURSOR_W] = {
 };
 
 // =====================================================================
-// Estado de la terminal (arrastrable)
+// Estado del terminal (uno solo, dentro de la ventana terminal)
 // =====================================================================
-static int  term_x = 100;
-static int  term_y = 80;
-static int  term_w = TERM_WIN_W;
-static int  term_h = TERM_WIN_H;
-static int  term_dragging   = 0;
-static int  term_drag_off_x = 0;
-static int  term_drag_off_y = 0;
+static struct TerminalState g_term_state;
+static int g_term_window_id = -1;
+
+// Estado de arrastre de ventanas
+static int drag_window_id = -1;
+static int drag_off_x = 0;
+static int drag_off_y = 0;
 
 // =====================================================================
 // Región sucia
@@ -80,27 +82,29 @@ static void dirty_union(int x, int y, int w, int h) {
         return;
     }
 
-    int x1 = dirty_x;
-    int y1 = dirty_y;
-    int x2 = dirty_x + dirty_w;
-    int y2 = dirty_y + dirty_h;
+    int x1 = dirty_x, y1 = dirty_y;
+    int x2 = dirty_x + dirty_w, y2 = dirty_y + dirty_h;
 
     if (x < x1) x1 = x;
     if (y < y1) y1 = y;
     if (x + w > x2) x2 = x + w;
     if (y + h > y2) y2 = y + h;
 
-    dirty_x = x1;
-    dirty_y = y1;
-    dirty_w = x2 - x1;
-    dirty_h = y2 - y1;
+    dirty_x = x1; dirty_y = y1;
+    dirty_w = x2 - x1; dirty_h = y2 - y1;
 }
 
 static void dirty_all(void) {
-    dirty_x = 0;
-    dirty_y = 0;
-    dirty_w = gfx_width();
-    dirty_h = gfx_height();
+    dirty_x = 0; dirty_y = 0;
+    dirty_w = gfx_width(); dirty_h = gfx_height();
+}
+
+// Marcar toda la zona de una ventana como sucia
+static void dirty_window(int win_id) {
+    if (win_id < 0) return;
+    int x, y, w, h;
+    window_get_rect(win_id, &x, &y, &w, &h);
+    dirty_union(x - 2, y - 2, w + 6, h + 6);
 }
 
 // =====================================================================
@@ -116,7 +120,6 @@ static void draw_taskbar(void) {
 static void draw_clock(void) {
     int W = gfx_width();
     int H = gfx_height();
-
     RTCTime t;
     rtc_read(&t);
 
@@ -133,10 +136,8 @@ static void draw_clock(void) {
 
     int x = W - CLOCK_RIGHT - 8 * 8;
     int y = H - TASKBAR_HEIGHT + (TASKBAR_HEIGHT - 16) / 2;
-
     gfx_fill_rect(x - 4, H - TASKBAR_HEIGHT + 1,
                   8 * 8 + 8, TASKBAR_HEIGHT - 1, COLOR_TASKBAR_BG);
-
     gfx_draw_string(x, y, buf, COLOR_TASKBAR_TEXT, COLOR_TASKBAR_BG);
 }
 
@@ -155,16 +156,12 @@ static void clock_rect(int *x, int *y, int *w, int *h) {
 static void cursor_draw(int x, int y) {
     int W = gfx_width();
     int H = gfx_height();
-
     for (int j = 0; j < CURSOR_H; j++) {
         for (int i = 0; i < CURSOR_W; i++) {
             unsigned char v = cursor_bitmap[j][i];
             if (v == 0) continue;
-
-            int px = x + i;
-            int py = y + j;
+            int px = x + i, py = y + j;
             if (px < 0 || px >= W || py < 0 || py >= H) continue;
-
             unsigned int color = (v == 2) ? COLOR_CURSOR_BORDER
                                           : COLOR_CURSOR_FILL;
             gfx_putpixel(px, py, color);
@@ -173,7 +170,7 @@ static void cursor_draw(int x, int y) {
 }
 
 // =====================================================================
-// Reconstrucción del escritorio en una región sucia
+// Redibujo de una región
 // =====================================================================
 static void redraw_region(int rx, int ry, int rw, int rh, int mx, int my) {
     int W = gfx_width();
@@ -185,18 +182,15 @@ static void redraw_region(int rx, int ry, int rw, int rh, int mx, int my) {
     if (ry + rh > H) rh = H - ry;
     if (rw <= 0 || rh <= 0) return;
 
-    // 1. Fondo del escritorio
+    // 1. Fondo
     int desk_h = H - TASKBAR_HEIGHT;
     if (ry < desk_h) {
-        int y0 = ry;
-        int h0 = rh;
+        int y0 = ry, h0 = rh;
         if (y0 + h0 > desk_h) h0 = desk_h - y0;
-        if (h0 > 0) {
-            gfx_fill_rect(rx, y0, rw, h0, COLOR_DESKTOP_BG);
-        }
+        if (h0 > 0) gfx_fill_rect(rx, y0, rw, h0, COLOR_DESKTOP_BG);
     }
 
-    // 2. Etiquetas del escritorio
+    // 2. Etiquetas
     if (ry < 60 && ry + rh > 20) {
         gfx_draw_string(20, 20, "MiniOS Desktop", 0x00FFFFFF, COLOR_DESKTOP_BG);
         gfx_draw_string(20, 40, "Escribe comandos en la terminal.",
@@ -209,20 +203,22 @@ static void redraw_region(int rx, int ry, int rw, int rh, int mx, int my) {
         draw_clock();
     }
 
-    // 4. Terminal
-    if (terminal_is_visible()) {
-        int tx, ty, tw, th;
-        terminal_get_rect(&tx, &ty, &tw, &th);
-        int overlap = !(rx + rw <= tx || rx >= tx + tw ||
-                        ry + rh <= ty || ry >= ty + th);
+    // 4. Ventanas
+    for (int i = 0; i < MAX_WINDOWS; i++) {
+        struct Window *win = window_get(i);
+        if (!win || !win->visible) continue;
+
+        int wx = win->x, wy = win->y, ww = win->w, wh = win->h;
+        int overlap = !(rx + rw <= wx || rx >= wx + ww ||
+                        ry + rh <= wy || ry >= wy + wh);
         if (overlap) {
-            terminal_draw();
+            window_draw(i);
         }
     }
 }
 
 // =====================================================================
-// Frame: aplica la región sucia, dibuja cursor, flip
+// Frame
 // =====================================================================
 static void apply_dirty(int mx, int my) {
     if (dirty_w <= 0 || dirty_h <= 0) return;
@@ -230,10 +226,7 @@ static void apply_dirty(int mx, int my) {
     int W = gfx_width();
     int H = gfx_height();
 
-    int rx = dirty_x;
-    int ry = dirty_y;
-    int rw = dirty_w;
-    int rh = dirty_h;
+    int rx = dirty_x, ry = dirty_y, rw = dirty_w, rh = dirty_h;
     if (rx < 0) { rw += rx; rx = 0; }
     if (ry < 0) { rh += ry; ry = 0; }
     if (rx + rw > W) rw = W - rx;
@@ -244,13 +237,21 @@ static void apply_dirty(int mx, int my) {
 
     int overlap_cursor = !(rx + rw <= mx || rx >= mx + CURSOR_W ||
                            ry + rh <= my || ry >= my + CURSOR_H);
-    if (overlap_cursor) {
-        cursor_draw(mx, my);
-    }
+    if (overlap_cursor) cursor_draw(mx, my);
 
     gfx_backbuffer_flip_region(rx, ry, rw, rh);
-
     dirty_reset();
+}
+
+// =====================================================================
+// Callbacks para screen.cpp (redireccion de kprintf -> terminal)
+// =====================================================================
+void desktop_terminal_putchar(char c) {
+    terminal_putchar_state(&g_term_state, c);
+}
+
+void desktop_terminal_clear(void) {
+    terminal_clear_state(&g_term_state);
 }
 
 // =====================================================================
@@ -266,31 +267,36 @@ void desktop_run(void) {
         kprintf("desktop: AVISO sin backbuffer (habra parpadeo)\n");
     }
 
-    kprintf("desktop: inicializando raton...\n");
     int r = mouse_init();
     kprintf("desktop: mouse_init = %d\n", r);
-
-    int W = gfx_width();
-    int H = gfx_height();
-    (void)W; (void)H;
 
     int mx = mouse_get_x();
     int my = mouse_get_y();
 
-    // =========================================================
-    // 1. Activar redireccion a la terminal
-    //    (a partir de aqui, screen_putchar -> terminal_putchar)
-    // =========================================================
+    // 1. Inicializar el sistema de ventanas
+    window_system_init();
+
+    // 2. Crear la ventana terminal
+    g_term_window_id = window_create(100, 80, 700, 450,
+                                      "C:\\> MiniOS Terminal");
+
+    terminal_init_state(&g_term_state);
+
+    window_add_terminal(g_term_window_id,
+                        0, 0,
+                        700 - WIN_PADDING * 2,
+                        450 - WIN_TITLEBAR_H - WIN_PADDING * 2,
+                        &g_term_state);
+
+    window_set_focus(g_term_window_id);
+
+    // 3. Activar redireccion de kprintf -> terminal
     screen_set_terminal_mode(1);
 
-    // 2. Inicializar la terminal grafica
-    terminal_init(term_x, term_y, term_w, term_h);
-    terminal_set_focus(1);
-
-    // 3. Arrancar la shell: imprime "> " en la terminal
+    // 4. Arrancar la shell: imprime "> " en la terminal
     shell_init();
 
-    // 4. Primer frame completo
+    // 5. Primer frame
     dirty_all();
     apply_dirty(mx, my);
 
@@ -299,20 +305,23 @@ void desktop_run(void) {
 
     while (1) {
         // -------------------------------------------------------------
-        // Teclado: va a la SHELL, que escribe con screen_putchar,
-        // que redirige a terminal_putchar.
+        // Teclado
         // -------------------------------------------------------------
         char c = keyboard_getchar();
         if (c) {
-            shell_handle_key(c);
-
-            int tx, ty, tw, th;
-            terminal_get_rect(&tx, &ty, &tw, &th);
-            dirty_union(tx - 1, ty - 1, tw + 2, th + 2);
+            int focused_win = window_get_focused();
+            if (focused_win >= 0) {
+                if (window_handle_key(focused_win, c)) {
+                    dirty_window(focused_win);
+                }
+            } else {
+                shell_handle_key(c);
+                dirty_window(g_term_window_id);
+            }
         }
 
         // -------------------------------------------------------------
-        // Parpadeo del cursor de la terminal + reloj
+        // Parpadeo + reloj
         // -------------------------------------------------------------
         unsigned int now = pit_get_ticks();
         if (now - last_tick >= 100) {
@@ -322,13 +331,9 @@ void desktop_run(void) {
             clock_rect(&cx, &cy, &cw, &ch);
             dirty_union(cx, cy, cw, ch);
 
-            if (terminal_is_visible() && terminal_get_focus()) {
-                int tx, ty, tw, th;
-                terminal_get_rect(&tx, &ty, &tw, &th);
-                dirty_union(tx - 1, ty - 1, tw + 2, th + 2);
-            }
+            terminal_blink_state(&g_term_state);
+            dirty_window(g_term_window_id);
         }
-        terminal_blink_tick();
 
         // -------------------------------------------------------------
         // Ratón
@@ -342,45 +347,63 @@ void desktop_run(void) {
                 mx = nmx;
                 my = nmy;
                 dirty_union(mx, my, CURSOR_W, CURSOR_H);
+
+                for (int i = 0; i < MAX_WINDOWS; i++) {
+                    if (window_handle_mouse_move(i, mx, my)) {
+                        dirty_window(i);
+                    }
+                }
             }
 
             int now_left = mouse_left_pressed();
             int click = (now_left && !last_left);
 
             if (click) {
-                if (terminal_point_in_close(mx, my)) {
-                    int tx, ty, tw, th;
-                    terminal_get_rect(&tx, &ty, &tw, &th);
-                    dirty_union(tx - 1, ty - 1, tw + 2, th + 2);
-                    terminal_close();
-                }
-                else if (terminal_point_in_titlebar(mx, my)) {
-                    term_dragging   = 1;
-                    term_drag_off_x = mx - term_x;
-                    term_drag_off_y = my - term_y;
-                    terminal_set_focus(1);
+                int win_id = window_find_at(mx, my);
+                if (win_id >= 0) {
+                    if (window_point_in_close(win_id, mx, my)) {
+                        window_hide(win_id);
+                        dirty_window(win_id);
+                    } else if (window_point_in_titlebar(win_id, mx, my)) {
+                        drag_window_id = win_id;
+                        int wx, wy;
+                        window_get_rect(win_id, &wx, &wy, 0, 0);
+                        drag_off_x = mx - wx;
+                        drag_off_y = my - wy;
+                        window_set_focus(win_id);
+                        window_raise(win_id);
+                        dirty_all();
+                    } else if (window_point_in_body(win_id, mx, my)) {
+                        window_set_focus(win_id);
+                        window_raise(win_id);
+                        window_handle_mouse_click(win_id, mx, my);
+                        dirty_window(win_id);
+                    }
                 }
             }
 
-            if (!now_left && term_dragging) {
-                term_dragging = 0;
+            if (!now_left && drag_window_id >= 0) {
+                drag_window_id = -1;
             }
 
-            if (term_dragging) {
-                int nx = mx - term_drag_off_x;
-                int ny = my - term_drag_off_y;
-                if (nx != term_x || ny != term_y) {
-                    int tx, ty, tw, th;
-                    terminal_get_rect(&tx, &ty, &tw, &th);
-                    dirty_union(tx - 1, ty - 1, tw + 2, th + 2);
-
-                    term_x = nx;
-                    term_y = ny;
-                    terminal_set_pos(nx, ny);
-
-                    terminal_get_rect(&tx, &ty, &tw, &th);
-                    dirty_union(tx - 1, ty - 1, tw + 2, th + 2);
+            if (drag_window_id >= 0) {
+                int nx = mx - drag_off_x;
+                int ny = my - drag_off_y;
+                int ox, oy;
+                window_get_rect(drag_window_id, &ox, &oy, 0, 0);
+                if (nx != ox || ny != oy) {
+                    dirty_window(drag_window_id);
+                    window_set_pos(drag_window_id, nx, ny);
+                    dirty_window(drag_window_id);
                     dirty_union(mx, my, CURSOR_W, CURSOR_H);
+                }
+            }
+
+            if (!now_left && last_left) {
+                for (int i = 0; i < MAX_WINDOWS; i++) {
+                    if (window_handle_mouse_release(i, mx, my)) {
+                        dirty_window(i);
+                    }
                 }
             }
 
