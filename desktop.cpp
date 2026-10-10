@@ -18,10 +18,21 @@
 #define COLOR_CURSOR_FILL    0x00FFFFFF
 #define COLOR_CURSOR_BORDER  0x00000000
 
+#define COLOR_CPU_LOW        0x0034D399   /* verde  */
+#define COLOR_CPU_MED        0x00FBBF24   /* ámbar  */
+#define COLOR_CPU_HIGH       0x00EF4444   /* rojo   */
+#define COLOR_CPU_TRACK      0x002A4A6E   /* fondo barra */
+
 #define TASKBAR_HEIGHT  28
 #define CLOCK_RIGHT     10
 #define CURSOR_W        8
 #define CURSOR_H        12
+
+/* Ancho total del widget de CPU (texto + barra) en píxeles */
+#define CPU_WIDGET_W    72
+#define CPU_TEXT_W      40      /* "CPU 100%" = 8 chars * 8 px = 64, recortamos */
+#define CPU_BAR_W       20
+#define CPU_BAR_H       10
 
 // =====================================================================
 // Helpers de string (antes de usarlos)
@@ -54,7 +65,6 @@ static const unsigned char cursor_bitmap[CURSOR_H][CURSOR_W] = {
 
 // =====================================================================
 // Variable global de la ventana terminal
-// (arriba porque los callbacks de screen.cpp la necesitan)
 // =====================================================================
 static int term_wid = -1;
 
@@ -100,6 +110,62 @@ static void dirty_all(void) {
 }
 
 // =====================================================================
+// Estadísticas de CPU (medidor)
+// =====================================================================
+/*
+ * Idea: cada "ventana de medida" (por ejemplo 1 segundo = 100 ticks de
+ * PIT a 100 Hz) contamos cuántos ticks han pasado mientras había trabajo
+ * pendiente (dirty region activa) y cuántos mientras el bucle estaba
+ * inactivo (durmiendo). El porcentaje de uso es:
+ *
+ *      cpu_pct = (busy_ticks * 100) / total_ticks
+ *
+ * Como el PIT dispara a 100 Hz, cada tick son 10 ms. Esto es una
+ * aproximación razonable para un SO didáctico y no requiere APIC ni
+ * contadores de TSC.
+ */
+static unsigned int cpu_total_ticks = 0;
+static unsigned int cpu_busy_ticks  = 0;
+static int          cpu_percent     = 0;
+static unsigned int cpu_window_start = 0;
+
+/* PIT a 100 Hz → cada 100 ticks = 1 s. Si tu PIT va a otra frecuencia,
+   ajusta esta constante. */
+#define PIT_HZ 100
+
+static void cpu_stats_reset(void) {
+    cpu_total_ticks = 0;
+    cpu_busy_ticks  = 0;
+    cpu_percent     = 0;
+    cpu_window_start = pit_get_ticks();
+}
+
+/* Llamar al final de cada iteración del bucle.
+ * busy = 1 si hacemos trabajo, 0 si sólo dormimos. */
+static void cpu_stats_tick(int busy) {
+    unsigned int now = pit_get_ticks();
+    if (now != cpu_window_start) {
+        /* Han pasado uno o más ticks desde la última muestra. */
+        unsigned int delta = now - cpu_window_start;
+        cpu_window_start = now;
+        cpu_total_ticks += delta;
+        if (busy) cpu_busy_ticks += delta;
+    } else {
+        if (busy) cpu_busy_ticks += 0; /* mismo tick, no sumamos todavía */
+        return;
+    }
+
+    if (cpu_total_ticks >= (unsigned)PIT_HZ) {
+        cpu_percent = (int)((cpu_busy_ticks * 100u) / cpu_total_ticks);
+        if (cpu_percent > 100) cpu_percent = 100;
+
+        /* Reiniciar la ventana */
+        cpu_total_ticks = 0;
+        cpu_busy_ticks  = 0;
+    }
+}
+
+// =====================================================================
 // Helpers de dibujo
 // =====================================================================
 static void draw_taskbar(void) {
@@ -128,6 +194,58 @@ static void clock_rect(int *x, int *y, int *w, int *h) {
     *y = H - TASKBAR_HEIGHT + 1;
     *w = 8 * 8 + 8;
     *h = TASKBAR_HEIGHT - 1;
+}
+
+/* ---------- Widget de CPU ---------- */
+static void cpu_widget_rect(int *x, int *y, int *w, int *h) {
+    int W = gfx_width(), H = gfx_height();
+    int cx, cy, cw, ch;
+    clock_rect(&cx, &cy, &cw, &ch);
+    *w = CPU_WIDGET_W;
+    *h = TASKBAR_HEIGHT - 1;
+    *x = cx - 6 - *w;
+    *y = cy;
+}
+
+static unsigned int cpu_color_for(int pct) {
+    if (pct < 30) return COLOR_CPU_LOW;
+    if (pct < 70) return COLOR_CPU_MED;
+    return COLOR_CPU_HIGH;
+}
+
+static void draw_cpu_widget(void) {
+    int x, y, w, h;
+    cpu_widget_rect(&x, &y, &w, &h);
+
+    /* Fondo */
+    gfx_fill_rect(x, y, w, h, COLOR_TASKBAR_BG);
+
+    /* Texto: "CPU xxx%" (recortado a 8 caracteres) */
+    char buf[9];
+    buf[0] = 'C'; buf[1] = 'P'; buf[2] = 'U'; buf[3] = ' ';
+
+    int pct = cpu_percent;
+    if (pct < 0) pct = 0;
+    if (pct > 100) pct = 100;
+    buf[4] = (pct >= 100) ? '1' : ' ';
+    buf[5] = (pct >= 100) ? '0' : ('0' + ((pct / 10) % 10));
+    buf[6] = '0' + (pct % 10);
+    buf[7] = '%';
+    buf[8] = 0;
+
+    int ty = y + (h - 16) / 2;
+    gfx_draw_string(x, ty, buf, COLOR_TASKBAR_TEXT, COLOR_TASKBAR_BG);
+
+    /* Barra horizontal a la derecha del texto */
+    int bx = x + CPU_TEXT_W + 2;
+    int by = y + (h - CPU_BAR_H) / 2;
+    gfx_fill_rect(bx, by, CPU_BAR_W, CPU_BAR_H, COLOR_CPU_TRACK);
+
+    int fill_w = (pct * CPU_BAR_W) / 100;
+    if (fill_w > 0)
+        gfx_fill_rect(bx, by, fill_w, CPU_BAR_H, cpu_color_for(pct));
+
+    gfx_draw_rect(bx, by, CPU_BAR_W, CPU_BAR_H, COLOR_TASKBAR_TEXT);
 }
 
 static void cursor_draw(int x, int y) {
@@ -165,6 +283,7 @@ static void redraw_region(int rx, int ry, int rw, int rh) {
     if (ry + rh > H - TASKBAR_HEIGHT) {
         draw_taskbar();
         draw_clock();
+        draw_cpu_widget();
     }
 
     win_redraw_all();
@@ -198,7 +317,6 @@ static void apply_dirty(int mx, int my) {
 #define TERM_LINE_MAX  64
 static char  term_line[TERM_LINE_MAX];
 static int   term_len = 0;
-/* term_wid ya está declarado arriba */
 
 static void term_print(const char *s) {
     if (term_wid < 0) return;
@@ -334,6 +452,22 @@ static void term_handle_key(char c) {
 }
 
 // =====================================================================
+// Dormir la CPU hasta la próxima interrupción
+// =====================================================================
+/*
+ * Equivalente a "sti; hlt" del x86. Sólo lo llamamos cuando NO hay
+ * trabajo pendiente (nada sucio, nada del ratón, nada del teclado).
+ * La CPU entra en estado C1 y consume muy poco hasta la próxima IRQ
+ * (timer, teclado, ratón, ...).
+ *
+ * Importante: habilita interrupciones ANTES del hlt para que el hlt
+ * no cuelgue la máquina para siempre.
+ */
+static inline void cpu_idle_wait(void) {
+    __asm__ __volatile__("sti; hlt");
+}
+
+// =====================================================================
 // Escritorio principal
 // =====================================================================
 void desktop_run(void) {
@@ -365,18 +499,33 @@ void desktop_run(void) {
     apply_dirty(mx, my);
 
     unsigned int last_tick = pit_get_ticks();
+    cpu_stats_reset();
 
     while (1) {
+        int did_work = 0;               /* <-- nuevo: ¿esta iteración trabajó? */
         unsigned int now = pit_get_ticks();
 
+        /* ---------- Reloj: refresco 1 vez por segundo ---------- */
         if (now - last_tick >= 100) {
             last_tick = now;
             int cx, cy, cw, ch;
             clock_rect(&cx, &cy, &cw, &ch);
             dirty_union(cx, cy, cw, ch);
+            did_work = 1;
         }
 
-        /* ----- Ratón ----- */
+        /* ---------- Widget de CPU: refresco 1 vez por segundo ---------- */
+        {
+            static unsigned int last_cpu_tick = 0;
+            if (now - last_cpu_tick >= 100) {
+                last_cpu_tick = now;
+                int cx, cy, cw, ch;
+                cpu_widget_rect(&cx, &cy, &cw, &ch);
+                dirty_union(cx, cy, cw, ch);
+            }
+        }
+
+        /* ---------- Ratón ---------- */
         if (mouse_is_ready()) {
             int nmx = mouse_get_x();
             int nmy = mouse_get_y();
@@ -385,6 +534,7 @@ void desktop_run(void) {
                 dirty_union(mx, my, CURSOR_W, CURSOR_H);
                 mx = nmx; my = nmy;
                 dirty_union(mx, my, CURSOR_W, CURSOR_H);
+                did_work = 1;
             }
 
             int now_left = mouse_left_pressed();
@@ -404,19 +554,38 @@ void desktop_run(void) {
                 } else {
                     dirty_all();
                 }
+                did_work = 1;
             }
             last_btn = now_left;
         }
 
-        /* ----- Teclado → terminal gráfica ----- */
+        /* ---------- Teclado → terminal gráfica ---------- */
         char c = keyboard_getchar();
         if (c) {
             term_handle_key(c);
+            did_work = 1;
         }
 
-        if (dirty_w > 0 && dirty_h > 0)
+        /* ---------- Aplicar dirty si hay algo pendiente ---------- */
+        if (dirty_w > 0 && dirty_h > 0) {
             apply_dirty(mx, my);
+            did_work = 1;
+        }
 
-        thread_yield();
+        /* ---------- Contabilidad de CPU ---------- */
+        cpu_stats_tick(did_work);
+
+        /* ---------- Dormir o ceder la CPU ---------- */
+        /*
+         * Si en esta iteración no hicimos nada, no tiene sentido girar.
+         * Dormimos con hlt hasta la próxima IRQ (timer 10 ms, teclado,
+         * ratón). Si sí hicimos algo, cedemos con thread_yield() para
+         * dar oportunidad a otras tareas del sistema.
+         */
+        if (!did_work) {
+            cpu_idle_wait();        /* bajo consumo: casi 0% CPU */
+        } else {
+            thread_yield();         /* hay multitarea, cedemos */
+        }
     }
 }
