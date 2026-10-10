@@ -284,7 +284,8 @@ extern "C" int gfx_backbuffer_init(void) {
 
     unsigned int bytes = (unsigned int)fb_w * fb_h * sizeof(uint32_t);
 
-    if (bytes > 4u * 1024u * 1024u) {
+    /* Límite subido a 16 MB para 1280x1024x32 (5 MB) y similares */
+    if (bytes > 16u * 1024u * 1024u) {
         kprintf("gfx: backbuffer demasiado grande (%u bytes), no lo creo\n",
                 bytes);
         return 0;

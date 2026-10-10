@@ -124,7 +124,35 @@ static void screen_scroll_vga(void) {
     }
     cursor_y = VGA_H - 1;
 }
+// =====================================================================
+// API que screen.cpp espera (redirige al terminal gráfico)
+// =====================================================================
+extern "C" void desktop_terminal_clear(void) {
+    if (term_wid >= 0) {
+        win_sys_clear(term_wid);
+        term_prompt();
+        int x, y, w, h;
+        if (win_get_rect(term_wid, &x, &y, &w, &h) == 0)
+            dirty_union(x, y, w, h);
+    }
+}
 
+extern "C" void desktop_terminal_putchar(char c) {
+    if (term_wid < 0) return;
+
+    if (c == '\n') {
+        win_sys_write(term_wid, "\n", 1);
+    } else if (c == '\b') {
+        win_sys_write(term_wid, "\b", 1);
+    } else if (c >= 32 && c < 127) {
+        char ch[2] = { c, 0 };
+        win_sys_write(term_wid, ch, 1);
+    }
+
+    int x, y, w, h;
+    if (win_get_rect(term_wid, &x, &y, &w, &h) == 0)
+        dirty_union(x, y, w, h);
+}
 // =====================================================================
 // Scroll grafico
 // =====================================================================

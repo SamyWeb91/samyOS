@@ -28,11 +28,11 @@ int  win_sys_write(int id, const char *str, int len);
 int  win_sys_rect(int id, int x, int y, int w, int h, uint32_t color);
 int  win_sys_title(int id, const char *title);
 
-/* Helpers para el desktop */
+/* Desktop helpers */
 void win_handle_click(int mx, int my, int button);
 int  win_get_focused(void);
 void win_set_focused(int id);
-int  win_get_rect(int id, int *x, int *y, int *w, int *h);
+int  win_get_rect(int id, int *x, int *y, int *w, int *h);  /* 0 = ok */
 
 #ifdef __cplusplus
 }
