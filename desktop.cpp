@@ -7,6 +7,7 @@
 #include "thread.h"
 #include "mouse.h"
 #include "win.h"
+#include "cpu_monitor.h"
 
 // =====================================================================
 // Colores
@@ -30,12 +31,12 @@
 
 /* Ancho total del widget de CPU (texto + barra) en píxeles */
 #define CPU_WIDGET_W    72
-#define CPU_TEXT_W      40      /* "CPU 100%" = 8 chars * 8 px = 64, recortamos */
+#define CPU_TEXT_W      40
 #define CPU_BAR_W       20
 #define CPU_BAR_H       10
 
 // =====================================================================
-// Helpers de string (antes de usarlos)
+// Helpers de string
 // =====================================================================
 static int str_eq(const char *a, const char *b) {
     while (*a && *b) {
@@ -68,9 +69,6 @@ static const unsigned char cursor_bitmap[CURSOR_H][CURSOR_W] = {
 // =====================================================================
 static int term_wid = -1;
 
-// =====================================================================
-// Callbacks para screen.cpp
-// =====================================================================
 extern "C" void desktop_terminal_putchar(char c) {
     if (term_wid < 0) return;
     win_sys_write(term_wid, &c, 1);
@@ -110,59 +108,13 @@ static void dirty_all(void) {
 }
 
 // =====================================================================
-// Estadísticas de CPU (medidor)
+// Estadísticas de CPU (delegadas a cpu_monitor.cpp)
 // =====================================================================
-/*
- * Idea: cada "ventana de medida" (por ejemplo 1 segundo = 100 ticks de
- * PIT a 100 Hz) contamos cuántos ticks han pasado mientras había trabajo
- * pendiente (dirty region activa) y cuántos mientras el bucle estaba
- * inactivo (durmiendo). El porcentaje de uso es:
- *
- *      cpu_pct = (busy_ticks * 100) / total_ticks
- *
- * Como el PIT dispara a 100 Hz, cada tick son 10 ms. Esto es una
- * aproximación razonable para un SO didáctico y no requiere APIC ni
- * contadores de TSC.
- */
-static unsigned int cpu_total_ticks = 0;
-static unsigned int cpu_busy_ticks  = 0;
-static int          cpu_percent     = 0;
-static unsigned int cpu_window_start = 0;
-
-/* PIT a 100 Hz → cada 100 ticks = 1 s. Si tu PIT va a otra frecuencia,
-   ajusta esta constante. */
-#define PIT_HZ 100
+static int cpu_percent = 0;
 
 static void cpu_stats_reset(void) {
-    cpu_total_ticks = 0;
-    cpu_busy_ticks  = 0;
-    cpu_percent     = 0;
-    cpu_window_start = pit_get_ticks();
-}
-
-/* Llamar al final de cada iteración del bucle.
- * busy = 1 si hacemos trabajo, 0 si sólo dormimos. */
-static void cpu_stats_tick(int busy) {
-    unsigned int now = pit_get_ticks();
-    if (now != cpu_window_start) {
-        /* Han pasado uno o más ticks desde la última muestra. */
-        unsigned int delta = now - cpu_window_start;
-        cpu_window_start = now;
-        cpu_total_ticks += delta;
-        if (busy) cpu_busy_ticks += delta;
-    } else {
-        if (busy) cpu_busy_ticks += 0; /* mismo tick, no sumamos todavía */
-        return;
-    }
-
-    if (cpu_total_ticks >= (unsigned)PIT_HZ) {
-        cpu_percent = (int)((cpu_busy_ticks * 100u) / cpu_total_ticks);
-        if (cpu_percent > 100) cpu_percent = 100;
-
-        /* Reiniciar la ventana */
-        cpu_total_ticks = 0;
-        cpu_busy_ticks  = 0;
-    }
+    cpu_monitor_init();
+    cpu_percent = 0;
 }
 
 // =====================================================================
@@ -205,6 +157,7 @@ static void cpu_widget_rect(int *x, int *y, int *w, int *h) {
     *h = TASKBAR_HEIGHT - 1;
     *x = cx - 6 - *w;
     *y = cy;
+    (void)W; (void)H;
 }
 
 static unsigned int cpu_color_for(int pct) {
@@ -220,7 +173,7 @@ static void draw_cpu_widget(void) {
     /* Fondo */
     gfx_fill_rect(x, y, w, h, COLOR_TASKBAR_BG);
 
-    /* Texto: "CPU xxx%" (recortado a 8 caracteres) */
+    /* Texto: "CPU xxx%" */
     char buf[9];
     buf[0] = 'C'; buf[1] = 'P'; buf[2] = 'U'; buf[3] = ' ';
 
@@ -454,15 +407,6 @@ static void term_handle_key(char c) {
 // =====================================================================
 // Dormir la CPU hasta la próxima interrupción
 // =====================================================================
-/*
- * Equivalente a "sti; hlt" del x86. Sólo lo llamamos cuando NO hay
- * trabajo pendiente (nada sucio, nada del ratón, nada del teclado).
- * La CPU entra en estado C1 y consume muy poco hasta la próxima IRQ
- * (timer, teclado, ratón, ...).
- *
- * Importante: habilita interrupciones ANTES del hlt para que el hlt
- * no cuelgue la máquina para siempre.
- */
 static inline void cpu_idle_wait(void) {
     __asm__ __volatile__("sti; hlt");
 }
@@ -502,7 +446,7 @@ void desktop_run(void) {
     cpu_stats_reset();
 
     while (1) {
-        int did_work = 0;               /* <-- nuevo: ¿esta iteración trabajó? */
+        int did_work = 0;
         unsigned int now = pit_get_ticks();
 
         /* ---------- Reloj: refresco 1 vez por segundo ---------- */
@@ -573,19 +517,17 @@ void desktop_run(void) {
         }
 
         /* ---------- Contabilidad de CPU ---------- */
-        cpu_stats_tick(did_work);
+        cpu_monitor_begin_iter();
+        cpu_monitor_end_iter();
+        cpu_percent = cpu_monitor_usage();
 
         /* ---------- Dormir o ceder la CPU ---------- */
-        /*
-         * Si en esta iteración no hicimos nada, no tiene sentido girar.
-         * Dormimos con hlt hasta la próxima IRQ (timer 10 ms, teclado,
-         * ratón). Si sí hicimos algo, cedemos con thread_yield() para
-         * dar oportunidad a otras tareas del sistema.
-         */
         if (!did_work) {
-            cpu_idle_wait();        /* bajo consumo: casi 0% CPU */
+            cpu_monitor_sleep_start();
+            cpu_idle_wait();
+            cpu_monitor_sleep_end();
         } else {
-            thread_yield();         /* hay multitarea, cedemos */
+            thread_yield();
         }
     }
 }
