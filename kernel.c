@@ -18,6 +18,8 @@
 #include "vbe.h"
 #include "gfx.h"
 #include "desktop.h"
+#include "win.h"          // <-- NUEVO
+
 // Declarado en screen.cpp
 void screen_set_gfx_mode(void);
 
@@ -54,18 +56,13 @@ extern "C" void kernel_main(void) {
     if (vbe_available()) {
         gfx_init();
 
-        // Inicializar el backbuffer ANTES de cualquier kprintf.
         gfx_backbuffer_init();
-
-        // Limpiar el backbuffer a negro
         gfx_clear(0x00000000);
-
-        // Volcar el backbuffer limpio al framebuffer de una vez.
         gfx_backbuffer_flip();
 
         screen_set_gfx_mode();
 
-        kprintf("MiniOS v7.1\n");
+        kprintf("MiniOS v7.3\n");
         kprintf("=================\n\n");
         kprintf("VBE: %ux%u %ubpp\n",
                 vbe_width(), vbe_height(), vbe_bpp());
@@ -101,6 +98,12 @@ extern "C" void kernel_main(void) {
     thread_init();
 
     kprintf("Threads listos\n");
+
+    // =============================================================
+    // NUEVO: subsistema de ventanas ring 3
+    // =============================================================
+    win_init();
+    kprintf("Ventanas ring 3 listas\n");
 
     // =============================================================
     // Activar IRQs ANTES del flip final.
