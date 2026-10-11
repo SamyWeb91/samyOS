@@ -18,7 +18,8 @@
 #include "vbe.h"
 #include "gfx.h"
 #include "desktop.h"
-#include "win.h"          // <-- NUEVO
+#include "win.h"
+#include "pat.h"          // <-- NUEVO
 
 // Declarado en screen.cpp
 void screen_set_gfx_mode(void);
@@ -42,6 +43,12 @@ extern "C" void kernel_main(void) {
     // =============================================================
     paging_init();
     paging_enable_now();
+
+    // =============================================================
+    // PASO 2.5: PAT para write-combining del framebuffer
+    // (debe ir antes de gfx_init, que mapea el framebuffer con PTE_PAT)
+    // =============================================================
+    pat_init();
 
     // =============================================================
     // PASO 3: heap

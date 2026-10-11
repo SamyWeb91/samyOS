@@ -76,14 +76,17 @@ extern "C" void gfx_init(void) {
         return;
     }
 
-    // Mapear TODO el framebuffer: pitch * height, redondeado a KB
+    // Mapear TODO el framebuffer: pitch * height, redondeado a KB.
+    // PTE_PAT activa el write-combining en esta zona (PAT entrada 1 = WC,
+    // configurada por pat_init() en kernel.c antes de gfx_init()).
     uint32_t total_bytes = (uint32_t)fb_pitch * (uint32_t)fb_h;
     uint32_t size_kb = (total_bytes + 0xFFF) / 0x400 + 1;
-    paging_map_range(addr, addr, size_kb, PTE_PRESENT | PTE_RW);
+    paging_map_range(addr, addr, size_kb,
+                     PTE_PRESENT | PTE_RW | PTE_PAT);
 
     fb = (uint8_t *)addr;
 
-    kprintf("gfx: %dx%d %ubpp pitch=%u bytes fb=%x (mapeado %u KB)\n",
+    kprintf("gfx: %dx%d %ubpp pitch=%u bytes fb=%x (mapeado %u KB, WC)\n",
             fb_w, fb_h, fb_bpp, fb_pitch, addr, size_kb);
 }
 
@@ -333,7 +336,7 @@ extern "C" void gfx_backbuffer_flip(void) {
         if (fb_bpp == 32) {
             uint32_t *d32 = (uint32_t *)dst;
             for (int x = 0; x < fb_w; x++) {
-                d32[x] = pack_to_fb(src[x]);
+                d32[x] = src[x];
             }
             // Rellenar el padding de la linea con negro
             uint32_t n = (uint32_t)fb_pitch / 4;
@@ -372,7 +375,7 @@ extern "C" void gfx_backbuffer_flip_region(int rx, int ry, int rw, int rh) {
             uint32_t *src = bb + (uint32_t)y * bb_w + rx;
             uint32_t *dst = (uint32_t *)(fb + (uint32_t)y * fb_pitch) + rx;
             for (int x = 0; x < rw; x++) {
-                dst[x] = pack_to_fb(src[x]);
+                dst[x] = src[x];
             }
         }
     } else if (fb_bpp == 24) {

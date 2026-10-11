@@ -20,3 +20,4 @@ unsigned int paging_get_pt0_addr();
 #define PTE_PRESENT  0x1
 #define PTE_RW       0x2
 #define PTE_USER     0x4
+#define PTE_PAT      0x80
