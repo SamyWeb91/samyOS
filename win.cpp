@@ -262,3 +262,35 @@ extern "C" int win_get_rect(int id, int *x, int *y, int *w, int *h) {
     *x = v->x; *y = v->y; *w = v->w; *h = v->h;
     return 0;
 }
+
+/* =====================================================================
+ * NUEVAS: foco y movimiento para el compositor
+ * ===================================================================== */
+
+extern "C" int win_focus(int id) {
+    int idx = -1;
+    for (int i = 0; i < WIN32_MAX; i++) {
+        if (wins[i].used && wins[i].id == id) { idx = i; break; }
+    }
+    if (idx < 0) return -1;
+
+    /* Mover la ventana al final del array (se dibuja encima) */
+    if (idx != WIN32_MAX - 1) {
+        struct Win32 tmp = wins[idx];
+        for (int i = idx; i < WIN32_MAX - 1; i++) {
+            wins[i] = wins[i + 1];
+        }
+        wins[WIN32_MAX - 1] = tmp;
+    }
+
+    focused_id = id;
+    return 0;
+}
+
+extern "C" int win_move(int id, int x, int y) {
+    struct Win32 *v = find(id);
+    if (!v) return -1;
+    v->x = x;
+    v->y = y;
+    return 0;
+}

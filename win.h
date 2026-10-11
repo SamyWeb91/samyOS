@@ -33,7 +33,9 @@ void win_handle_click(int mx, int my, int button);
 int  win_get_focused(void);
 void win_set_focused(int id);
 int  win_get_rect(int id, int *x, int *y, int *w, int *h);  /* 0 = ok */
-
+/* --- NUEVAS (para el compositor) --- */
+int win_focus(int id);                 /* trae al frente + foco */
+int win_move(int id, int x, int y);    /* mueve a (x,y) */
 #ifdef __cplusplus
 }
 #endif
