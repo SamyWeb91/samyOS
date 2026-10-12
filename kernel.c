@@ -19,10 +19,16 @@
 #include "gfx.h"
 #include "desktop.h"
 #include "win.h"
-#include "pat.h"          // <-- NUEVO
+#include "pat.h"
+#include "ramdisk.h"
 
 // Declarado en screen.cpp
 void screen_set_gfx_mode(void);
+
+// =====================================================================
+// Buffer estatico del ramdisk (en .bss, no en stack)
+// =====================================================================
+static unsigned char ramdisk_buffer[64 * 1024] __attribute__((aligned(4096)));
 
 // =====================================================================
 // kernel_main
@@ -46,7 +52,6 @@ extern "C" void kernel_main(void) {
 
     // =============================================================
     // PASO 2.5: PAT para write-combining del framebuffer
-    // (debe ir antes de gfx_init, que mapea el framebuffer con PTE_PAT)
     // =============================================================
     pat_init();
 
@@ -54,6 +59,20 @@ extern "C" void kernel_main(void) {
     // PASO 3: heap
     // =============================================================
     heap_init();
+
+    // =============================================================
+    // PASO 3.5: ramdisk estatico
+    // =============================================================
+    {
+        int rd = ramdisk_create_static((unsigned int)ramdisk_buffer,
+                                       (unsigned int)sizeof(ramdisk_buffer));
+        if (rd >= 0) {
+            kprintf("Ramdisk: id=%d, %u bytes\n",
+                    rd, (unsigned int)sizeof(ramdisk_buffer));
+        } else {
+            kprintf("Ramdisk: no se pudo crear\n");
+        }
+    }
 
     // =============================================================
     // PASO 4: VBE + GFX + Backbuffer
@@ -107,7 +126,7 @@ extern "C" void kernel_main(void) {
     kprintf("Threads listos\n");
 
     // =============================================================
-    // NUEVO: subsistema de ventanas ring 3
+    // Subsistema de ventanas
     // =============================================================
     win_init();
     kprintf("Ventanas ring 3 listas\n");
@@ -120,7 +139,7 @@ extern "C" void kernel_main(void) {
     kprintf("\nEscribe 'help' para ver los comandos.\n\n");
 
     // =============================================================
-    // FLIP FINAL: volcar todo el backbuffer al framebuffer.
+    // FLIP FINAL
     // =============================================================
     if (gfx_backbuffer_active()) {
         gfx_backbuffer_flip();
