@@ -1,4 +1,4 @@
-// desktop.cpp — version de prueba con 3 ventanas
+// desktop.cpp
 #include "desktop.h"
 #include "gfx.h"
 #include "screen.h"
@@ -9,6 +9,7 @@
 #include "win.h"
 #include "cpu_monitor.h"
 #include "composer.h"
+#include "taskbar_start.h"
 
 // =====================================================================
 // Helpers de string
@@ -22,10 +23,23 @@ static int str_eq(const char *a, const char *b) {
 }
 
 // =====================================================================
-// Callbacks para screen.cpp (aunque no los usemos, deben existir)
+// Callbacks para screen.cpp
 // =====================================================================
 extern "C" void desktop_terminal_putchar(char c) { (void)c; }
 extern "C" void desktop_terminal_clear(void) { }
+
+// =====================================================================
+// Callback del menu de inicio
+// =====================================================================
+static void start_action(int action) {
+    switch (action) {
+        case 1: kprintf("menu: Terminal\n");    break;
+        case 2: kprintf("menu: Acerca de\n");   break;
+        case 3: kprintf("menu: Reiniciar\n");   break;
+        case 4: kprintf("menu: Cerrar todo\n"); break;
+        default: break;
+    }
+}
 
 // =====================================================================
 // Dormir la CPU
@@ -35,7 +49,7 @@ static inline void cpu_idle_wait(void) {
 }
 
 // =====================================================================
-// Escritorio principal (version minima de prueba)
+// Escritorio principal
 // =====================================================================
 void desktop_run(void) {
     if (!gfx_ready()) {
@@ -50,6 +64,9 @@ void desktop_run(void) {
 
     /* ---------- Compositor ---------- */
     composer_init();
+
+    /* ---------- Menu de inicio ---------- */
+    taskbar_start_init(start_action);
 
     /* ---------- 3 ventanas de prueba ---------- */
     int w1 = win_sys_create(60,  60, 300, 200, "Ventana 1");
@@ -80,7 +97,7 @@ void desktop_run(void) {
         /* ---------- Reloj + CPU: refresco periodico del compositor ---------- */
         if (composer_periodic(now)) did_work = 1;
 
-        /* ---------- Raton: cursor + click + drag ---------- */
+        /* ---------- Raton: cursor + click + drag + menu ---------- */
         if (composer_handle_mouse()) did_work = 1;
 
         /* ---------- Teclado: no hacemos nada, solo consumir ---------- */

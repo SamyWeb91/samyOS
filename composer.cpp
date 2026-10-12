@@ -7,6 +7,7 @@
 #include "mouse.h"
 #include "win.h"
 #include "cpu_monitor.h"
+#include "taskbar_start.h"
 
 // =====================================================================
 // Colores
@@ -34,6 +35,10 @@
 #define CPU_BAR_H       10
 
 #define TITLEBAR_H      20
+
+/* Zona en la que el menu de inicio puede dibujarse (por encima de la
+   taskbar). Se usa para marcar dirty cuando cambia el hover. */
+#define START_MENU_ZONE_H 200
 
 // =====================================================================
 // Cursor
@@ -92,6 +97,14 @@ static void dirty_union(int x, int y, int w, int h) {
 static void dirty_all(void) {
     dirty_x = 0; dirty_y = 0;
     dirty_w = gfx_width(); dirty_h = gfx_height();
+}
+
+/* Marca la zona donde puede aparecer el menu de inicio. */
+static void dirty_start_zone(void) {
+    int W = gfx_width(), H = gfx_height();
+    int top = H - TASKBAR_HEIGHT - START_MENU_ZONE_H;
+    if (top < 0) top = 0;
+    dirty_union(0, top, W, H - top);
 }
 
 // =====================================================================
@@ -204,6 +217,7 @@ static void redraw_region(int rx, int ry, int rw, int rh) {
 
     if (ry + rh > H - TASKBAR_HEIGHT) {
         draw_taskbar();
+        taskbar_start_draw();   /* boton Inicio + menu (si abierto) */
         draw_clock();
         draw_cpu_widget();
     }
@@ -260,16 +274,34 @@ extern "C" int composer_handle_mouse(void) {
     int nmx = mouse_get_x();
     int nmy = mouse_get_y();
 
+    /* --- Movimiento del raton --- */
     if (nmx != mouse_x || nmy != mouse_y) {
         dirty_union(mouse_x, mouse_y, CURSOR_W, CURSOR_H);
         mouse_x = nmx;
         mouse_y = nmy;
         dirty_union(mouse_x, mouse_y, CURSOR_W, CURSOR_H);
         changed = 1;
+
+        /* Hover del menu de inicio (solo si el raton esta por la zona) */
+        if (mouse_y >= gfx_height() - TASKBAR_HEIGHT - START_MENU_ZONE_H) {
+            if (taskbar_start_hover(mouse_x, mouse_y)) {
+                dirty_start_zone();
+                changed = 1;
+            }
+        }
     }
 
     int now_left = mouse_left_pressed();
     int click = (now_left && !last_left);
+
+    /* --- Click: primero la UI del taskbar (boton Inicio + menu) --- */
+    if (click) {
+        if (taskbar_start_click(mouse_x, mouse_y)) {
+            dirty_start_zone();
+            last_left = now_left;
+            return 1;
+        }
+    }
 
     /* --- Click: detectar si va a la barra de titulo de una ventana --- */
     if (click) {
@@ -322,7 +354,7 @@ extern "C" int composer_handle_mouse(void) {
         }
     }
 
-    /* --- Click normal --- */
+    /* --- Click normal (no en barra de titulo) --- */
     if (click && mouse_mode == MOUSE_IDLE &&
         mouse_y < gfx_height() - TASKBAR_HEIGHT) {
         int fid = win_get_focused();
