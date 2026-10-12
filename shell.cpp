@@ -9,6 +9,7 @@
 #include "composer.h"
 #include "mfs.h"
 #include "folder.h"
+#include "ahci.h"      /* <-- NUEVO */
 
 /* =====================================================================
  * Forward declarations
@@ -28,11 +29,10 @@ static unsigned int str_len(const char *s);
 #define EDIT_BUF_MAX  3800
 
 typedef struct {
-    int  wid;                       /* -1 si libre */
+    int  wid;
     char line[TERM_LINE_MAX];
     int  len;
 
-    /* Editor */
     int  editing;
     char edit_name[16];
     int  edit_len;
@@ -222,6 +222,7 @@ static void cmd_help(int wid) {
     term_println(wid, "  df         - uso del ramdisk");
     term_println(wid, "  edit <n>   - editor grafico");
     term_println(wid, "  files      - gestor grafico de archivos");
+    term_println(wid, "  disk       - estado del disco AHCI");
     term_println(wid, "  close      - cerrar esta ventana");
     term_println(wid, "  reboot     - reiniciar");
 }
@@ -381,6 +382,54 @@ static void cmd_files(int wid) {
     }
 }
 
+/* =====================================================================
+ * Comando disk: estado del disco AHCI
+ * ===================================================================== */
+static void cmd_disk(int wid) {
+    term_println(wid, "=== DISCO AHCI ===");
+
+    if (!ahci_is_ready()) {
+        term_println(wid, "AHCI: no disponible");
+        return;
+    }
+
+    unsigned int count = (unsigned int)ahci_get_sector_count();
+    unsigned int mb = (unsigned int)((ahci_get_sector_count() * 512ULL) / (1024ULL * 1024ULL));
+
+    term_println(wid, "Estado:    LISTO");
+    term_print(wid, "Sectores:  ");
+    print_uint(wid, count);
+    term_println(wid, "");
+    term_print(wid, "Capacidad: ");
+    print_uint(wid, mb);
+    term_println(wid, " MiB");
+
+    /* Leer sector 0 */
+    static unsigned char buf[512];
+    if (!ahci_read_sector(0, buf)) {
+        term_println(wid, "Error al leer sector 0");
+        return;
+    }
+
+    term_println(wid, "MBR (primeros 16 bytes):");
+    for (int i = 0; i < 16; i++) {
+        char hex[4];
+        unsigned char b = buf[i];
+        hex[0] = "0123456789ABCDEF"[(b >> 4) & 0xF];
+        hex[1] = "0123456789ABCDEF"[b & 0xF];
+        hex[2] = ' ';
+        hex[3] = 0;
+        term_print(wid, hex);
+    }
+    term_println(wid, "");
+
+    if (buf[510] == 0x55 && buf[511] == 0xAA) {
+        term_println(wid, "Firma 0x55AA: OK (hay MBR)");
+    } else {
+        term_println(wid, "Firma 0x55AA: NO (disco sin MBR)");
+    }
+}
+
 static void cmd_execute(int wid, ShellTerm *t, const char *cmd) {
     if (cmd[0] == 0) return;
 
@@ -391,6 +440,7 @@ static void cmd_execute(int wid, ShellTerm *t, const char *cmd) {
     else if (str_eq(cmd, "uptime"))  cmd_uptime(wid);
     else if (str_eq(cmd, "ls"))      cmd_ls(wid);
     else if (str_eq(cmd, "df"))      cmd_df(wid);
+    else if (str_eq(cmd, "disk"))    cmd_disk(wid);
     else if (str_eq(cmd, "files"))   cmd_files(wid);
     else if (str_starts_with(cmd, "echo "))  term_println(wid, cmd + 5);
     else if (str_starts_with(cmd, "touch ")) cmd_touch(wid, cmd + 6);
@@ -465,7 +515,6 @@ extern "C" int shell_new_terminal(int x, int y, int w, int h, const char *title)
 extern "C" void shell_handle_key(int wid, char c) {
     if (wid < 0) return;
 
-    /* Si es un folder, va al gestor */
     if (folder_is_folder(wid)) {
         folder_handle_key(wid, c);
         return;
@@ -477,13 +526,11 @@ extern "C" void shell_handle_key(int wid, char c) {
     }
     if (!t) return;
 
-    /* Si esta en modo editor, va al editor */
     if (t->editing) {
         editor_handle_key(wid, t, c);
         return;
     }
 
-    /* Modo shell normal */
     if (c == '\n') {
         win_sys_write(wid, "\n", 1);
         t->line[t->len] = 0;

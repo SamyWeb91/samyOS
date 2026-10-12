@@ -111,14 +111,25 @@ extern "C" void kernel_main(void) {
     kprintf("Paging activado\n");
     kprintf("Heap inicializado\n");
 
-    kprintf("MMIO: no mapeado (modo seguro, sin AHCI)\n");
+    // =============================================================
+    // PASO 5.5: AHCI (solo lectura)   /* === AHCI === */
+    // =============================================================
+    kprintf("Iniciando AHCI...\n");
+    if (ahci_init()) {
+        unsigned int sec = (unsigned int)ahci_get_sector_count();
+        unsigned int mib = (unsigned int)((sec * 512ULL) / (1024ULL * 1024ULL));
+        kprintf("AHCI: %u sectores (%u MiB), puerto %d\n",
+                sec, mib, ahci_get_port_index());
+    } else {
+        kprintf("AHCI: no disponible\n");
+    }
 
     kprintf("\n");
     syscall_init();
     user_init();
 
     kprintf("\n");
-    kprintf("[MODO SEGURO] AHCI y FS deshabilitados (no se toca el disco)\n");
+    kprintf("AHCI: modo solo lectura activo\n");   /* === AHCI === */
 
     kprintf("\n");
     thread_init();
