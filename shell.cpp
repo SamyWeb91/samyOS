@@ -6,6 +6,7 @@
 #include "pit.h"
 #include "ramdisk.h"
 #include "libc.h"
+#include "composer.h"     /* <-- NUEVO */
 
 /* =====================================================================
  * Forward declarations
@@ -25,7 +26,7 @@ static unsigned int str_len(const char *s);
 #define EDIT_BUF_MAX  3800
 
 typedef struct {
-    int  wid;                       /* -1 si libre */
+    int  wid;
     char line[TERM_LINE_MAX];
     int  len;
 
@@ -297,6 +298,9 @@ static void editor_draw(int wid, ShellTerm *t) {
     } else {
         win_sys_write(wid, t->edit_buf, t->edit_len);
     }
+
+    /* Marcar la ventana como sucia para que el compositor la repinte */
+    composer_dirty_window(wid);
 }
 
 static int editor_open(int x, int y, int w, int h, const char *name) {
@@ -319,6 +323,10 @@ static int editor_open(int x, int y, int w, int h, const char *name) {
     int wid = win_sys_create(x, y, w, h, title);
     if (wid < 0) return -1;
 
+    /* Traer al frente: asi el compositor la pinta encima de la terminal
+       y no se "borra" cuando el cursor pasa por encima. */
+    win_focus(wid);
+
     ShellTerm *t = &terms[slot];
     t->wid = wid;
     t->len = 0;
@@ -336,11 +344,19 @@ static int editor_open(int x, int y, int w, int h, const char *name) {
     else       t->edit_len = r;
 
     editor_draw(wid, t);
+
+    /* Marcar toda la zona de la ventana nueva para que se pinte ya */
+    composer_dirty_window(wid);
+
     return wid;
 }
 
 static void editor_handle_key(int wid, ShellTerm *t, char c) {
     if (c == 27) {   /* ESC */
+        /* Marcar la zona de la ventana ANTES de destruirla para que el
+           compositor repinte el fondo en su sitio (si no, queda pegada
+           la imagen fantasma en el framebuffer). */
+        composer_dirty_window(wid);
         t->wid = -1;
         t->editing = 0;
         win_sys_destroy(wid);
@@ -350,7 +366,6 @@ static void editor_handle_key(int wid, ShellTerm *t, char c) {
     if (c == 19) {   /* Ctrl+S */
         int r = fs_write_file(t->edit_name, t->edit_buf, t->edit_len);
         if (r < 0) {
-            /* Redibujar con aviso */
             editor_draw(wid, t);
             term_println(wid, "\nERROR al guardar");
         } else {
@@ -578,6 +593,8 @@ static void cmd_execute(int wid, ShellTerm *t, const char *cmd) {
     else if (str_starts_with(cmd, "rm "))    cmd_rm(wid, cmd + 3);
     else if (str_starts_with(cmd, "edit "))  cmd_edit(wid, cmd + 5);
     else if (str_eq(cmd, "close")) {
+        /* Marcar antes de destruir */
+        composer_dirty_window(wid);
         t->wid = -1;
         win_sys_destroy(wid);
         return;
@@ -624,6 +641,10 @@ extern "C" int shell_new_terminal(int x, int y, int w, int h, const char *title)
     int wid = win_sys_create(x, y, w, h, title);
     if (wid < 0) return -1;
 
+    /* Traer al frente y marcar para repintar */
+    win_focus(wid);
+    composer_dirty_window(wid);
+
     terms[slot].wid = wid;
     terms[slot].len = 0;
     terms[slot].line[0] = 0;
@@ -636,6 +657,7 @@ extern "C" int shell_new_terminal(int x, int y, int w, int h, const char *title)
     term_println(wid, "");
     term_prompt(wid);
 
+    composer_dirty_window(wid);
     return wid;
 }
 
@@ -662,11 +684,13 @@ extern "C" void shell_handle_key(int wid, char c) {
         t->len = 0;
         if (t->wid < 0) return;
         term_prompt(wid);
+        composer_dirty_window(wid);
     }
     else if (c == '\b') {
         if (t->len > 0) {
             t->len--;
             win_sys_write(wid, "\b", 1);
+            composer_dirty_window(wid);
         }
     }
     else if (c >= 32 && c < 127) {
@@ -674,6 +698,7 @@ extern "C" void shell_handle_key(int wid, char c) {
             t->line[t->len++] = c;
             char ch[2] = { c, 0 };
             win_sys_write(wid, ch, 1);
+            composer_dirty_window(wid);
         }
     }
 }
