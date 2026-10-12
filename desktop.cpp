@@ -10,17 +10,7 @@
 #include "cpu_monitor.h"
 #include "composer.h"
 #include "taskbar_start.h"
-
-// =====================================================================
-// Helpers de string
-// =====================================================================
-static int str_eq(const char *a, const char *b) {
-    while (*a && *b) {
-        if (*a != *b) return 0;
-        a++; b++;
-    }
-    return *a == 0 && *b == 0;
-}
+#include "shell.h"
 
 // =====================================================================
 // Callbacks para screen.cpp
@@ -31,13 +21,37 @@ extern "C" void desktop_terminal_clear(void) { }
 // =====================================================================
 // Callback del menu de inicio
 // =====================================================================
+static int next_term_x = 60;
+static int next_term_y = 60;
+static int next_term_n = 1;
+
 static void start_action(int action) {
     switch (action) {
-        case 1: kprintf("menu: Terminal\n");    break;
-        case 2: kprintf("menu: Acerca de\n");   break;
-        case 3: kprintf("menu: Reiniciar\n");   break;
-        case 4: kprintf("menu: Cerrar todo\n"); break;
-        default: break;
+        case 1: {
+            /* Nueva terminal, con posicion escalonada */
+            char title[32];
+            title[0] = 'T'; title[1] = 'e'; title[2] = 'r'; title[3] = 'm';
+            title[4] = 'i'; title[5] = 'n'; title[6] = 'a'; title[7] = 'l';
+            title[8] = ' '; title[9] = '0' + (next_term_n % 10); title[10] = 0;
+            shell_new_terminal(next_term_x, next_term_y, 420, 280, title);
+            next_term_x += 30;
+            next_term_y += 30;
+            if (next_term_x > 400) { next_term_x = 60; next_term_y = 60; }
+            next_term_n++;
+            composer_force_redraw();
+            break;
+        }
+        case 2:
+            kprintf("menu: Acerca de MiniSO v8.3\n");
+            break;
+        case 3:
+            kprintf("menu: Reiniciar\n");
+            break;
+        case 4:
+            kprintf("menu: Cerrar todo\n");
+            break;
+        default:
+            break;
     }
 }
 
@@ -65,45 +79,35 @@ void desktop_run(void) {
     /* ---------- Compositor ---------- */
     composer_init();
 
+    /* ---------- Shell ---------- */
+    shell_init();
+
     /* ---------- Menu de inicio ---------- */
     taskbar_start_init(start_action);
 
-    /* ---------- 3 ventanas de prueba ---------- */
-    int w1 = win_sys_create(60,  60, 300, 200, "Ventana 1");
-    int w2 = win_sys_create(400, 80, 300, 200, "Ventana 2");
-    int w3 = win_sys_create(200, 240, 300, 200, "Ventana 3");
-
-    kprintf("desktop: ventanas creadas w1=%d w2=%d w3=%d\n", w1, w2, w3);
-
-    if (w1 >= 0) {
-        win_sys_write(w1, "Ventana de prueba 1\n", 20);
-        win_sys_write(w1, "Arrastrame por la barra azul\n", 29);
-    }
-    if (w2 >= 0) {
-        win_sys_write(w2, "Ventana de prueba 2\n", 20);
-        win_sys_write(w2, "Click en la X para cerrar\n", 26);
-    }
-    if (w3 >= 0) {
-        win_sys_write(w3, "Ventana de prueba 3\n", 20);
-        win_sys_write(w3, "El raton debe moverse suave\n", 28);
-    }
-
+    /* ---------- Primera terminal ---------- */
+    int wid = shell_new_terminal(60, 60, 420, 280, "Terminal 1");
+    composer_set_terminal(wid);
     composer_force_redraw();
 
     while (1) {
         int did_work = 0;
         unsigned int now = pit_get_ticks();
 
-        /* ---------- Reloj + CPU: refresco periodico del compositor ---------- */
+        /* ---------- Reloj + CPU ---------- */
         if (composer_periodic(now)) did_work = 1;
 
-        /* ---------- Raton: cursor + click + drag + menu ---------- */
+        /* ---------- Raton ---------- */
         if (composer_handle_mouse()) did_work = 1;
 
-        /* ---------- Teclado: no hacemos nada, solo consumir ---------- */
+        /* ---------- Teclado: enviar a la ventana enfocada si es terminal ---------- */
         char c = keyboard_getchar();
         if (c) {
-            (void)c;
+            int fid = win_get_focused();
+            if (fid >= 0 && shell_is_terminal(fid)) {
+                shell_handle_key(fid, c);
+                composer_dirty_window(fid);
+            }
             did_work = 1;
         }
 
