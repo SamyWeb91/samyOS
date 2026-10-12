@@ -22,11 +22,18 @@ static unsigned int str_len(const char *s);
  * Linea de entrada por terminal
  * ===================================================================== */
 #define TERM_LINE_MAX 64
+#define EDIT_BUF_MAX  3800
 
 typedef struct {
     int  wid;                       /* -1 si libre */
     char line[TERM_LINE_MAX];
     int  len;
+
+    /* Editor */
+    int  editing;
+    char edit_name[16];
+    int  edit_len;
+    char edit_buf[EDIT_BUF_MAX];
 } ShellTerm;
 
 static ShellTerm terms[SHELL_MAX_TERMS];
@@ -36,12 +43,12 @@ static int shell_ready = 0;
  * Mini-FS sobre el ramdisk
  * ===================================================================== */
 #define FS_RD_ID          0
-#define FS_MAGIC          0x5346524Du  /* "MRFS" */
+#define FS_MAGIC          0x5346524Du
 #define FS_HEADER_SIZE    0x10
 #define FS_MAX_FILES      16
 #define FS_ENTRY_SIZE     32
 #define FS_TABLE_SIZE     (FS_MAX_FILES * FS_ENTRY_SIZE)
-#define FS_DATA_START     (FS_HEADER_SIZE + FS_TABLE_SIZE)   /* 0x210 */
+#define FS_DATA_START     (FS_HEADER_SIZE + FS_TABLE_SIZE)
 
 typedef struct {
     unsigned int magic;
@@ -272,6 +279,112 @@ static void print_uint(int wid, unsigned int v) {
 }
 
 /* =====================================================================
+ * Editor grafico
+ * ===================================================================== */
+static void editor_draw(int wid, ShellTerm *t) {
+    win_sys_clear(wid);
+
+    /* Cabecera */
+    term_print(wid, "=== EDITOR: ");
+    term_print(wid, t->edit_name);
+    term_println(wid, " ===");
+    term_println(wid, "Ctrl+S=guardar  ESC=salir");
+    term_println(wid, "-----------------------------");
+
+    /* Contenido */
+    if (t->edit_len == 0) {
+        term_println(wid, "(vacio)");
+    } else {
+        win_sys_write(wid, t->edit_buf, t->edit_len);
+    }
+}
+
+static int editor_open(int x, int y, int w, int h, const char *name) {
+    /* Buscar slot */
+    int slot = -1;
+    for (int i = 0; i < SHELL_MAX_TERMS; i++) {
+        if (terms[i].wid < 0) { slot = i; break; }
+    }
+    if (slot < 0) return -1;
+
+    /* Titulo "Edit: nombre" */
+    char title[32];
+    title[0] = 'E'; title[1] = 'd'; title[2] = 'i'; title[3] = 't';
+    title[4] = ':'; title[5] = ' ';
+    int k = 6;
+    int n = 0;
+    while (name[n] && k < 30) { title[k++] = name[n++]; }
+    title[k] = 0;
+
+    int wid = win_sys_create(x, y, w, h, title);
+    if (wid < 0) return -1;
+
+    ShellTerm *t = &terms[slot];
+    t->wid = wid;
+    t->len = 0;
+    t->line[0] = 0;
+    t->editing = 1;
+
+    /* Copiar nombre */
+    k = 0;
+    while (name[k] && k < 15) { t->edit_name[k] = name[k]; k++; }
+    t->edit_name[k] = 0;
+
+    /* Cargar contenido del ramdisk */
+    int r = fs_read_file(t->edit_name, t->edit_buf, EDIT_BUF_MAX - 1);
+    if (r < 0) t->edit_len = 0;
+    else       t->edit_len = r;
+
+    editor_draw(wid, t);
+    return wid;
+}
+
+static void editor_handle_key(int wid, ShellTerm *t, char c) {
+    if (c == 27) {   /* ESC */
+        t->wid = -1;
+        t->editing = 0;
+        win_sys_destroy(wid);
+        return;
+    }
+
+    if (c == 19) {   /* Ctrl+S */
+        int r = fs_write_file(t->edit_name, t->edit_buf, t->edit_len);
+        if (r < 0) {
+            /* Redibujar con aviso */
+            editor_draw(wid, t);
+            term_println(wid, "\nERROR al guardar");
+        } else {
+            editor_draw(wid, t);
+            term_println(wid, "\nGuardado.");
+        }
+        return;
+    }
+
+    if (c == '\b') {
+        if (t->edit_len > 0) {
+            t->edit_len--;
+            editor_draw(wid, t);
+        }
+        return;
+    }
+
+    if (c == '\n') {
+        if (t->edit_len < EDIT_BUF_MAX - 1) {
+            t->edit_buf[t->edit_len++] = '\n';
+            editor_draw(wid, t);
+        }
+        return;
+    }
+
+    if (c >= 32 && c < 127) {
+        if (t->edit_len < EDIT_BUF_MAX - 1) {
+            t->edit_buf[t->edit_len++] = c;
+            editor_draw(wid, t);
+        }
+    }
+}
+
+/* =====================================================================
  * Comandos
  * ===================================================================== */
 static void cmd_help(int wid) {
@@ -288,6 +401,7 @@ static void cmd_help(int wid) {
     term_println(wid, "  write <n> <texto> - escribir en archivo");
     term_println(wid, "  rm <n>     - borrar archivo");
     term_println(wid, "  df         - uso del ramdisk");
+    term_println(wid, "  edit <n>   - editor grafico");
     term_println(wid, "  close      - cerrar esta ventana");
     term_println(wid, "  reboot     - reiniciar");
 }
@@ -425,6 +539,28 @@ static void cmd_df(int wid) {
     term_println(wid, " bytes");
 }
 
+static void cmd_edit(int shell_wid, const char *name) {
+    if (!fs_mounted) { term_println(shell_wid, "fs: no montado"); return; }
+    if (!name || !*name) { term_println(shell_wid, "uso: edit <nombre>"); return; }
+
+    /* Si no existe, crearlo vacio */
+    if (fs_find(name) < 0) {
+        if (fs_create(name) != 0) {
+            term_println(shell_wid, "edit: no se pudo crear");
+            return;
+        }
+    }
+
+    int wid = editor_open(80, 80, 460, 340, name);
+    if (wid < 0) {
+        term_println(shell_wid, "edit: no hay slots libres");
+        return;
+    }
+
+    term_print(shell_wid, "edit: abriendo ");
+    term_println(shell_wid, name);
+}
+
 static void cmd_execute(int wid, ShellTerm *t, const char *cmd) {
     if (cmd[0] == 0) return;
 
@@ -440,6 +576,7 @@ static void cmd_execute(int wid, ShellTerm *t, const char *cmd) {
     else if (str_starts_with(cmd, "cat "))   cmd_cat(wid, cmd + 4);
     else if (str_starts_with(cmd, "write ")) cmd_write(wid, cmd + 6);
     else if (str_starts_with(cmd, "rm "))    cmd_rm(wid, cmd + 3);
+    else if (str_starts_with(cmd, "edit "))  cmd_edit(wid, cmd + 5);
     else if (str_eq(cmd, "close")) {
         t->wid = -1;
         win_sys_destroy(wid);
@@ -462,11 +599,14 @@ extern "C" int shell_init(void) {
         terms[i].wid = -1;
         terms[i].len = 0;
         terms[i].line[0] = 0;
+        terms[i].editing = 0;
+        terms[i].edit_len = 0;
+        terms[i].edit_name[0] = 0;
     }
     shell_ready = 1;
 
     if (fs_mount() != 0) {
-        /* No es fatal, solo se desactivan los comandos de archivos */
+        /* No fatal */
     }
 
     return 0;
@@ -487,6 +627,9 @@ extern "C" int shell_new_terminal(int x, int y, int w, int h, const char *title)
     terms[slot].wid = wid;
     terms[slot].len = 0;
     terms[slot].line[0] = 0;
+    terms[slot].editing = 0;
+    terms[slot].edit_len = 0;
+    terms[slot].edit_name[0] = 0;
 
     term_println(wid, "MiniSO - Terminal grafica");
     term_println(wid, "Escribe 'help' para ver comandos");
@@ -505,6 +648,13 @@ extern "C" void shell_handle_key(int wid, char c) {
     }
     if (!t) return;
 
+    /* Si esta en modo editor, va al editor */
+    if (t->editing) {
+        editor_handle_key(wid, t, c);
+        return;
+    }
+
+    /* Modo shell normal */
     if (c == '\n') {
         win_sys_write(wid, "\n", 1);
         t->line[t->len] = 0;
@@ -533,6 +683,7 @@ extern "C" void shell_close_terminal(int wid) {
         if (terms[i].wid == wid) {
             terms[i].wid = -1;
             terms[i].len = 0;
+            terms[i].editing = 0;
             return;
         }
     }
