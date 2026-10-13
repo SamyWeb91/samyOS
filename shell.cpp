@@ -9,15 +9,16 @@
 #include "composer.h"
 #include "mfs.h"
 #include "folder.h"
-#include "ahci.h"      /* <-- NUEVO */
+#include "ahci.h"
+#include "disk.h"
 
 /* =====================================================================
  * Forward declarations
  * ===================================================================== */
-static void term_print(int wid, const char *s);
-static void term_println(int wid, const char *s);
+void term_print(int wid, const char *s);
+void term_println(int wid, const char *s);
 static void term_prompt(int wid);
-static void print_uint(int wid, unsigned int v);
+void print_uint(int wid, unsigned int v);
 static int  str_eq(const char *a, const char *b);
 static int  str_starts_with(const char *str, const char *prefix);
 static unsigned int str_len(const char *s);
@@ -70,14 +71,14 @@ static unsigned int str_len(const char *s) {
 /* =====================================================================
  * Helpers de impresion
  * ===================================================================== */
-static void term_print(int wid, const char *s) {
+void term_print(int wid, const char *s) {
     if (wid < 0) return;
     int n = 0;
     while (s[n]) n++;
     win_sys_write(wid, s, n);
 }
 
-static void term_println(int wid, const char *s) {
+void term_println(int wid, const char *s) {
     term_print(wid, s);
     term_print(wid, "\n");
 }
@@ -86,7 +87,7 @@ static void term_prompt(int wid) {
     term_print(wid, "> ");
 }
 
-static void print_uint(int wid, unsigned int v) {
+void print_uint(int wid, unsigned int v) {
     char buf[16];
     int n = 0;
     if (v == 0) buf[n++] = '0';
@@ -223,8 +224,12 @@ static void cmd_help(int wid) {
     term_println(wid, "  edit <n>   - editor grafico");
     term_println(wid, "  files      - gestor grafico de archivos");
     term_println(wid, "  disk       - estado del disco AHCI");
+    term_println(wid, "  partitions - lista particiones del MBR");
+    term_println(wid, "  hex <lba>  - volcar 512 bytes de un sector");
     term_println(wid, "  close      - cerrar esta ventana");
     term_println(wid, "  reboot     - reiniciar");
+    term_println(wid, "");
+    term_println(wid, "Scroll: PageUp / PageDown");
 }
 
 static void cmd_date(int wid) {
@@ -383,65 +388,25 @@ static void cmd_files(int wid) {
 }
 
 /* =====================================================================
- * Comando disk: estado del disco AHCI
+ * Dispatcher de comandos
  * ===================================================================== */
-static void cmd_disk(int wid) {
-    term_println(wid, "=== DISCO AHCI ===");
-
-    if (!ahci_is_ready()) {
-        term_println(wid, "AHCI: no disponible");
-        return;
-    }
-
-    unsigned int count = (unsigned int)ahci_get_sector_count();
-    unsigned int mb = (unsigned int)((ahci_get_sector_count() * 512ULL) / (1024ULL * 1024ULL));
-
-    term_println(wid, "Estado:    LISTO");
-    term_print(wid, "Sectores:  ");
-    print_uint(wid, count);
-    term_println(wid, "");
-    term_print(wid, "Capacidad: ");
-    print_uint(wid, mb);
-    term_println(wid, " MiB");
-
-    /* Leer sector 0 */
-    static unsigned char buf[512];
-    if (!ahci_read_sector(0, buf)) {
-        term_println(wid, "Error al leer sector 0");
-        return;
-    }
-
-    term_println(wid, "MBR (primeros 16 bytes):");
-    for (int i = 0; i < 16; i++) {
-        char hex[4];
-        unsigned char b = buf[i];
-        hex[0] = "0123456789ABCDEF"[(b >> 4) & 0xF];
-        hex[1] = "0123456789ABCDEF"[b & 0xF];
-        hex[2] = ' ';
-        hex[3] = 0;
-        term_print(wid, hex);
-    }
-    term_println(wid, "");
-
-    if (buf[510] == 0x55 && buf[511] == 0xAA) {
-        term_println(wid, "Firma 0x55AA: OK (hay MBR)");
-    } else {
-        term_println(wid, "Firma 0x55AA: NO (disco sin MBR)");
-    }
-}
-
 static void cmd_execute(int wid, ShellTerm *t, const char *cmd) {
     if (cmd[0] == 0) return;
 
-    if (str_eq(cmd, "help"))         cmd_help(wid);
-    else if (str_eq(cmd, "clear"))   win_sys_clear(wid);
-    else if (str_eq(cmd, "date"))    cmd_date(wid);
-    else if (str_eq(cmd, "ticks"))   cmd_ticks(wid);
-    else if (str_eq(cmd, "uptime"))  cmd_uptime(wid);
-    else if (str_eq(cmd, "ls"))      cmd_ls(wid);
-    else if (str_eq(cmd, "df"))      cmd_df(wid);
-    else if (str_eq(cmd, "disk"))    cmd_disk(wid);
-    else if (str_eq(cmd, "files"))   cmd_files(wid);
+    /* Comandos del disco (disk.cpp) */
+    if      (str_eq(cmd, "disk"))               disk_cmd_disk(wid);
+    else if (str_eq(cmd, "partitions"))         disk_cmd_partitions(wid);
+    else if (str_starts_with(cmd, "hex "))      disk_cmd_hex(wid, cmd + 4);
+
+    /* Resto de comandos del shell */
+    else if (str_eq(cmd, "help"))         cmd_help(wid);
+    else if (str_eq(cmd, "clear"))        win_sys_clear(wid);
+    else if (str_eq(cmd, "date"))         cmd_date(wid);
+    else if (str_eq(cmd, "ticks"))        cmd_ticks(wid);
+    else if (str_eq(cmd, "uptime"))       cmd_uptime(wid);
+    else if (str_eq(cmd, "ls"))           cmd_ls(wid);
+    else if (str_eq(cmd, "df"))           cmd_df(wid);
+    else if (str_eq(cmd, "files"))        cmd_files(wid);
     else if (str_starts_with(cmd, "echo "))  term_println(wid, cmd + 5);
     else if (str_starts_with(cmd, "touch ")) cmd_touch(wid, cmd + 6);
     else if (str_starts_with(cmd, "cat "))   cmd_cat(wid, cmd + 4);
@@ -477,6 +442,7 @@ extern "C" int shell_init(void) {
     }
     shell_ready = 1;
 
+    disk_init();
     mfs_mount();
     return 0;
 }
@@ -531,6 +497,30 @@ extern "C" void shell_handle_key(int wid, char c) {
         return;
     }
 
+    /* ================================================================
+     * SCROLL: Page Up / Page Down
+     * ================================================================
+     * Scancodes estandar PS/2:
+     *   Page Up   = 0x49
+     *   Page Down = 0x51
+     * Si tu driver los traduce a otros valores, ajustalos aqui.
+     * ================================================================ */
+    if (c == 0x49) {  /* Page Up */
+        win_sys_scroll_up(wid);
+        composer_dirty_window(wid);
+        return;
+    }
+    if (c == 0x51) {  /* Page Down */
+        win_sys_scroll_down(wid);
+        composer_dirty_window(wid);
+        return;
+    }
+
+    /* Si el usuario escribe algo, volver al fondo del scroll */
+    if (c == '\n' || c == '\b' || (c >= 32 && c < 127)) {
+        win_sys_scroll_reset(wid);
+    }
+
     if (c == '\n') {
         win_sys_write(wid, "\n", 1);
         t->line[t->len] = 0;
@@ -567,6 +557,11 @@ extern "C" void shell_close_terminal(int wid) {
         }
     }
 }
+
+/* Wrappers para que disk.cpp y otros modulos usen estas funciones */
+extern "C" void shell_term_print(int wid, const char *s) { term_print(wid, s); }
+extern "C" void shell_term_println(int wid, const char *s) { term_println(wid, s); }
+extern "C" void shell_print_uint(int wid, unsigned int v) { print_uint(wid, v); }
 
 extern "C" int shell_is_terminal(int wid) {
     if (wid < 0) return 0;

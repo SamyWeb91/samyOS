@@ -27,6 +27,16 @@ int  win_sys_clear(int id);
 int  win_sys_write(int id, const char *str, int len);
 int  win_sys_rect(int id, int x, int y, int w, int h, uint32_t color);
 int  win_sys_title(int id, const char *title);
+/* --- NUEVO: Scroll --- */
+#define WIN32_SCROLL_LINES  64   /* Historial total de líneas */
+#define WIN32_VISIBLE_ROWS  WIN32_ROWS
+
+/* Funciones de scroll */
+int  win_sys_scroll_up(int id);
+int  win_sys_scroll_down(int id);
+int  win_sys_scroll_reset(int id);
+int  win_sys_get_scroll(int id);
+int  win_sys_set_scroll(int id, int offset);
 
 /* Desktop helpers */
 void win_handle_click(int mx, int my, int button);

@@ -76,9 +76,6 @@ extern "C" void gfx_init(void) {
         return;
     }
 
-    // Mapear TODO el framebuffer: pitch * height, redondeado a KB.
-    // PTE_PAT activa el write-combining en esta zona (PAT entrada 1 = WC,
-    // configurada por pat_init() en kernel.c antes de gfx_init()).
     uint32_t total_bytes = (uint32_t)fb_pitch * (uint32_t)fb_h;
     uint32_t size_kb = (total_bytes + 0xFFF) / 0x400 + 1;
     paging_map_range(addr, addr, size_kb,
@@ -155,7 +152,6 @@ extern "C" void gfx_fill_rect(int x, int y, int w, int h, uint32_t color) {
 // Limpiar TODO el framebuffer, incluyendo el padding de cada linea
 extern "C" void gfx_clear(uint32_t color) {
     if (bb) {
-        // El backbuffer no tiene padding
         for (int y = 0; y < bb_h; y++) {
             uint32_t *p = bb + (uint32_t)y * bb_w;
             for (int x = 0; x < bb_w; x++) p[x] = color;
@@ -165,7 +161,6 @@ extern "C" void gfx_clear(uint32_t color) {
 
     if (!fb) return;
 
-    // Sin backbuffer: limpiar TODO el framebuffer (fb_pitch * fb_h)
     for (int y = 0; y < fb_h; y++) {
         uint8_t *p = fb + (uint32_t)y * fb_pitch;
 
@@ -246,6 +241,11 @@ extern "C" void gfx_copy_rect(int src_x, int src_y,
 // Texto
 // =====================================================================
 extern "C" void gfx_draw_char(int x, int y, char c, uint32_t fg, uint32_t bg) {
+    /* PROTECCIÓN: rechazar coordenadas fuera del framebuffer */
+    if (x < 0 || y < 0) return;
+    if (x + 8 > fb_w) return;
+    if (y + 16 > fb_h) return;
+
     unsigned char uc = (unsigned char)c;
     const uint8_t *glyph = font8x16[uc];
 
@@ -287,7 +287,6 @@ extern "C" int gfx_backbuffer_init(void) {
 
     unsigned int bytes = (unsigned int)fb_w * fb_h * sizeof(uint32_t);
 
-    /* Límite subido a 16 MB para 1280x1024x32 (5 MB) y similares */
     if (bytes > 16u * 1024u * 1024u) {
         kprintf("gfx: backbuffer demasiado grande (%u bytes), no lo creo\n",
                 bytes);
@@ -324,8 +323,6 @@ extern "C" int gfx_backbuffer_active(void) {
     return bb != 0;
 }
 
-// Flip COMPLETO: copia el backbuffer al framebuffer real.
-// Tambien limpia el padding de cada linea (si fb_pitch > fb_w*bpp/8).
 extern "C" void gfx_backbuffer_flip(void) {
     if (!fb || !bb) return;
 
@@ -338,7 +335,6 @@ extern "C" void gfx_backbuffer_flip(void) {
             for (int x = 0; x < fb_w; x++) {
                 d32[x] = src[x];
             }
-            // Rellenar el padding de la linea con negro
             uint32_t n = (uint32_t)fb_pitch / 4;
             for (uint32_t x = (uint32_t)fb_w; x < n; x++) d32[x] = 0;
         } else if (fb_bpp == 24) {

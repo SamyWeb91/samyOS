@@ -21,9 +21,9 @@ struct Win32 {
     int  id;
     int  x, y, w, h;
     char title[WIN32_TITLE_MAX];
-    char buf[WIN32_ROWS][WIN32_COLS];
+    char buf[WIN32_SCROLL_LINES][WIN32_COLS];
     int  cx, cy;
-    /* un rectángulo opcional persistente */
+    int  scroll_offset;
     int  has_rect;
     int  rx, ry, rw, rh;
     uint32_t rcolor;
@@ -38,6 +38,12 @@ extern "C" void win_init(void) {
         wins[i].used = 0;
         wins[i].id   = -1;
         wins[i].has_rect = 0;
+        wins[i].scroll_offset = 0;
+        wins[i].cx = 0;
+        wins[i].cy = 0;
+        for (int r = 0; r < WIN32_SCROLL_LINES; r++)
+            for (int c = 0; c < WIN32_COLS; c++)
+                wins[i].buf[r][c] = ' ';
     }
     next_id = 1;
     focused_id = -1;
@@ -49,6 +55,28 @@ static struct Win32 *find(int id) {
     return 0;
 }
 
+/* =====================================================================
+ * Scroll interno: mueve todo el historial una fila hacia arriba
+ * ===================================================================== */
+static void win_do_scroll(struct Win32 *v) {
+    for (int r = 0; r < WIN32_SCROLL_LINES - 1; r++)
+        for (int cc = 0; cc < WIN32_COLS; cc++)
+            v->buf[r][cc] = v->buf[r + 1][cc];
+
+    for (int cc = 0; cc < WIN32_COLS; cc++)
+        v->buf[WIN32_SCROLL_LINES - 1][cc] = ' ';
+
+    v->cy = WIN32_SCROLL_LINES - 1;
+
+    if (v->scroll_offset > 0) {
+        int max = WIN32_SCROLL_LINES - WIN32_VISIBLE_ROWS;
+        if (v->scroll_offset < max) v->scroll_offset++;
+    }
+}
+
+/* =====================================================================
+ * Dibujo de una ventana
+ * ===================================================================== */
 static void draw_one(struct Win32 *v) {
     /* sombra */
     gfx_fill_rect(v->x + 4, v->y + 4, v->w, v->h, W_SHADOW);
@@ -75,14 +103,33 @@ static void draw_one(struct Win32 *v) {
     /* texto del buffer */
     int tx = v->x + 6;
     int ty = v->y + TITLE_H + 4;
-    for (int r = 0; r < WIN32_ROWS; r++) {
+    int max_x = v->x + v->w - 2;
+    int max_y = v->y + v->h - 2;
+    int min_x = v->x + 2;
+    int min_y = v->y + TITLE_H;
+
+    /* Calcular primera fila visible con saturación */
+    int first_row = v->cy - WIN32_VISIBLE_ROWS - v->scroll_offset;
+    if (first_row < 0) first_row = 0;
+    if (first_row >= WIN32_SCROLL_LINES) first_row = WIN32_SCROLL_LINES - 1;
+
+    for (int r = 0; r < WIN32_VISIBLE_ROWS; r++) {
+        int src = first_row + r;
+        if (src < 0 || src >= WIN32_SCROLL_LINES) continue;
+
         for (int c = 0; c < WIN32_COLS; c++) {
-            char ch = v->buf[r][c];
+            char ch = v->buf[src][c];
             if (ch == 0 || ch == ' ') continue;
+
             int px = tx + c * CHAR_W;
             int py = ty + r * CHAR_H;
-            if (px + CHAR_W > v->x + v->w - 2) continue;
-            if (py + CHAR_H > v->y + v->h - 2) continue;
+
+            /* Comprobación completa: dentro de la ventana */
+            if (px < min_x) continue;
+            if (py < min_y) continue;
+            if (px + CHAR_W > max_x) continue;
+            if (py + CHAR_H > max_y) continue;
+
             gfx_draw_char(px, py, ch, W_TEXT_FG, W_TEXT_BG);
         }
     }
@@ -100,6 +147,9 @@ extern "C" void win_redraw_all(void) {
         if (wins[i].used) draw_one(&wins[i]);
 }
 
+/* =====================================================================
+ * Crear ventana
+ * ===================================================================== */
 extern "C" int win_sys_create(int x, int y, int w, int h, const char *title) {
     if (w < 80 || h < 40) return -1;
     int idx = -1;
@@ -112,6 +162,7 @@ extern "C" int win_sys_create(int x, int y, int w, int h, const char *title) {
     v->id   = next_id++;
     v->x = x; v->y = y; v->w = w; v->h = h;
     v->cx = 0; v->cy = 0;
+    v->scroll_offset = 0;
     v->has_rect = 0;
 
     int k = 0;
@@ -120,7 +171,7 @@ extern "C" int win_sys_create(int x, int y, int w, int h, const char *title) {
     }
     v->title[k] = 0;
 
-    for (int r = 0; r < WIN32_ROWS; r++)
+    for (int r = 0; r < WIN32_SCROLL_LINES; r++)
         for (int c = 0; c < WIN32_COLS; c++)
             v->buf[r][c] = ' ';
 
@@ -134,6 +185,7 @@ extern "C" int win_sys_destroy(int id) {
     v->used = 0;
     v->id   = -1;
     v->has_rect = 0;
+    v->scroll_offset = 0;
     if (focused_id == id) focused_id = -1;
     return 0;
 }
@@ -141,48 +193,54 @@ extern "C" int win_sys_destroy(int id) {
 extern "C" int win_sys_clear(int id) {
     struct Win32 *v = find(id);
     if (!v) return -1;
-    for (int r = 0; r < WIN32_ROWS; r++)
+
+    for (int r = 0; r < WIN32_SCROLL_LINES; r++)
         for (int c = 0; c < WIN32_COLS; c++)
             v->buf[r][c] = ' ';
-    v->cx = 0; v->cy = 0;
+
+    v->cx = 0;
+    v->cy = 0;
+    v->scroll_offset = 0;
     return 0;
 }
 
+/* =====================================================================
+ * Escritura en el buffer de la ventana
+ * ===================================================================== */
 extern "C" int win_sys_write(int id, const char *str, int len) {
     struct Win32 *v = find(id);
     if (!v) return -1;
 
+    /* Sanear estado por si acaso */
+    if (v->cx < 0) v->cx = 0;
+    if (v->cy < 0) v->cy = 0;
+    if (v->cx >= WIN32_COLS) v->cx = WIN32_COLS - 1;
+    if (v->cy >= WIN32_SCROLL_LINES) v->cy = WIN32_SCROLL_LINES - 1;
+
     for (int i = 0; i < len; i++) {
         char c = str[i];
+
         if (c == '\n') {
             v->cx = 0;
             v->cy++;
-            if (v->cy >= WIN32_ROWS) {
-                for (int r = 0; r < WIN32_ROWS - 1; r++)
-                    for (int cc = 0; cc < WIN32_COLS; cc++)
-                        v->buf[r][cc] = v->buf[r + 1][cc];
-                for (int cc = 0; cc < WIN32_COLS; cc++)
-                    v->buf[WIN32_ROWS - 1][cc] = ' ';
-                v->cy = WIN32_ROWS - 1;
+            if (v->cy >= WIN32_SCROLL_LINES) {
+                win_do_scroll(v);
             }
-        } else if (c == '\b') {
+        }
+        else if (c == '\b') {
             if (v->cx > 0) {
                 v->cx--;
                 v->buf[v->cy][v->cx] = ' ';
             }
-        } else if (c >= 32 && c < 127) {
+        }
+        else if (c >= 32 && c < 127) {
             v->buf[v->cy][v->cx] = c;
             v->cx++;
             if (v->cx >= WIN32_COLS) {
                 v->cx = 0;
                 v->cy++;
-                if (v->cy >= WIN32_ROWS) {
-                    for (int r = 0; r < WIN32_ROWS - 1; r++)
-                        for (int cc = 0; cc < WIN32_COLS; cc++)
-                            v->buf[r][cc] = v->buf[r + 1][cc];
-                    for (int cc = 0; cc < WIN32_COLS; cc++)
-                        v->buf[WIN32_ROWS - 1][cc] = ' ';
-                    v->cy = WIN32_ROWS - 1;
+                if (v->cy >= WIN32_SCROLL_LINES) {
+                    win_do_scroll(v);
                 }
             }
         }
@@ -210,8 +268,9 @@ extern "C" int win_sys_title(int id, const char *title) {
     return 0;
 }
 
-/* ---------- helpers para el desktop ---------- */
-
+/* =====================================================================
+ * Helpers para el desktop
+ * ===================================================================== */
 static int hit_test(int mx, int my) {
     for (int i = WIN32_MAX - 1; i >= 0; i--) {
         if (!wins[i].used) continue;
@@ -264,9 +323,8 @@ extern "C" int win_get_rect(int id, int *x, int *y, int *w, int *h) {
 }
 
 /* =====================================================================
- * NUEVAS: foco y movimiento para el compositor
+ * Foco y movimiento para el compositor
  * ===================================================================== */
-
 extern "C" int win_focus(int id) {
     int idx = -1;
     for (int i = 0; i < WIN32_MAX; i++) {
@@ -274,7 +332,6 @@ extern "C" int win_focus(int id) {
     }
     if (idx < 0) return -1;
 
-    /* Mover la ventana al final del array (se dibuja encima) */
     if (idx != WIN32_MAX - 1) {
         struct Win32 tmp = wins[idx];
         for (int i = idx; i < WIN32_MAX - 1; i++) {
@@ -293,4 +350,47 @@ extern "C" int win_move(int id, int x, int y) {
     v->x = x;
     v->y = y;
     return 0;
+}
+
+/* =====================================================================
+ * API de scroll
+ * ===================================================================== */
+extern "C" int win_sys_scroll_up(int id) {
+    struct Win32 *v = find(id);
+    if (!v) return -1;
+    int max = WIN32_SCROLL_LINES - WIN32_VISIBLE_ROWS;
+    if (max < 0) max = 0;
+    if (v->scroll_offset < max) v->scroll_offset++;
+    return v->scroll_offset;
+}
+
+extern "C" int win_sys_scroll_down(int id) {
+    struct Win32 *v = find(id);
+    if (!v) return -1;
+    if (v->scroll_offset > 0) v->scroll_offset--;
+    return v->scroll_offset;
+}
+
+extern "C" int win_sys_scroll_reset(int id) {
+    struct Win32 *v = find(id);
+    if (!v) return -1;
+    v->scroll_offset = 0;
+    return 0;
+}
+
+extern "C" int win_sys_get_scroll(int id) {
+    struct Win32 *v = find(id);
+    if (!v) return -1;
+    return v->scroll_offset;
+}
+
+extern "C" int win_sys_set_scroll(int id, int offset) {
+    struct Win32 *v = find(id);
+    if (!v) return -1;
+    int max = WIN32_SCROLL_LINES - WIN32_VISIBLE_ROWS;
+    if (max < 0) max = 0;
+    if (offset < 0) offset = 0;
+    if (offset > max) offset = max;
+    v->scroll_offset = offset;
+    return offset;
 }
