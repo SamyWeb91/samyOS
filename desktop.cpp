@@ -13,12 +13,6 @@
 #include "shell.h"
 
 // =====================================================================
-// Callbacks para screen.cpp
-// =====================================================================
-extern "C" void desktop_terminal_putchar(char c) { (void)c; }
-extern "C" void desktop_terminal_clear(void) { }
-
-// =====================================================================
 // Callback del menu de inicio
 // =====================================================================
 static int next_term_x = 60;
@@ -126,4 +120,25 @@ void desktop_run(void) {
             thread_yield();
         }
     }
+}
+
+// =====================================================================
+// Stubs para screen.cpp
+//
+// term_wid, term_prompt y dirty_union son simbolos que screen.cpp
+// usa para redirigir la salida al terminal grafico. Como no tenemos
+// terminal.cpp con esas definiciones, las dejamos como stubs.
+// En la practica nunca se ejecutan porque screen_set_terminal_mode(1)
+// no se llama desde el kernel.
+// =====================================================================
+
+extern "C" int term_wid = -1;
+
+extern "C" void term_prompt(void) {
+    /* stub: el compositor dibuja el prompt por su cuenta */
+}
+
+extern "C" void dirty_union(int x, int y, int w, int h) {
+    /* stub: el compositor se encarga del redibujado */
+    (void)x; (void)y; (void)w; (void)h;
 }
