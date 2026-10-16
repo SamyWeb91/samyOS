@@ -13,6 +13,33 @@
 #include "shell.h"
 
 // =====================================================================
+// >>> INICIO BLOQUE DE TEST FAT32 <<<
+// Este bloque es SOLO para probar fat32_win.cpp.
+// Cuando fat32 funcione, BORRA este bloque completo
+// (desde aqui hasta ">>> FIN BLOQUE DE TEST FAT32 <<<").
+// =====================================================================
+extern "C" int fat32_mount(uint32_t part_lba);
+extern "C" int fat32_is_mounted(void);
+extern "C" const void *fat32_get_volume(void);
+extern "C" int fat32_list(const char *path,
+                          void (*cb)(const char *name, uint32_t size,
+                                     uint8_t attr, uint32_t cluster));
+
+#define FAT32_TEST_LBA  2048   /* LBA de la particion FAT32 en disco.img */
+
+/* Callback que se llama por cada entrada del directorio */
+static void fat32_test_list_cb(const char *name, uint32_t size,
+                               uint8_t attr, uint32_t cluster)
+{
+    (void)cluster;
+    kprintf("[FAT32]   '%s'  %u bytes%s\n",
+            name, size, (attr & 0x10) ? "  <DIR>" : "");
+}
+// =====================================================================
+// >>> FIN BLOQUE DE TEST FAT32 <<<
+// =====================================================================
+
+// =====================================================================
 // Callback del menu de inicio
 // =====================================================================
 static int next_term_x = 60;
@@ -83,6 +110,27 @@ void desktop_run(void) {
     int wid = shell_new_terminal(60, 60, 420, 280, "Terminal 1");
     composer_set_terminal(wid);
     composer_force_redraw();
+
+    // =================================================================
+    // >>> INICIO LLAMADA DE TEST A FAT32 <<<
+    // Esta llamada es SOLO para probar fat32_win.cpp.
+    // Cuando fat32 funcione, BORRA este bloque completo
+    // (desde aqui hasta ">>> FIN LLAMADA DE TEST A FAT32 <<<").
+    // =================================================================
+    kprintf("[TEST] Probando fat32_mount(%u)...\n", FAT32_TEST_LBA);
+    int fat32_ok = fat32_mount(FAT32_TEST_LBA);
+    kprintf("[TEST] fat32_mount devolvio %d\n", fat32_ok);
+    if (fat32_ok) {
+        kprintf("[TEST] FAT32 montado correctamente\n");
+        kprintf("[TEST] Listando / ...\n");
+        int n = fat32_list("/", fat32_test_list_cb);
+        kprintf("[TEST] fat32_list devolvio %d\n", n);
+    } else {
+        kprintf("[TEST] FAT32 NO se pudo montar\n");
+    }
+    // =================================================================
+    // >>> FIN LLAMADA DE TEST A FAT32 <<<
+    // =================================================================
 
     while (1) {
         int did_work = 0;
