@@ -1,5 +1,5 @@
 #!/bin/bash
-# build.sh - Compila MiniOS completo (v9.2 + fat32_win + user_prog blob)
+# build.sh - Compila MiniOS completo (v9.4 + fat32_win + user_prog blob)
 
 set -e
 
@@ -17,8 +17,8 @@ fasm entry.asm entry.o
 echo "entry.o: $?"
 
 echo "=== Compilando isr.asm ==="
-fasm isr.asm isr.o
-echo "isr.o: $?"
+fasm isr.asm isr_asm.o
+echo "isr_asm.o: $?"
 
 echo "=== Compilando switch.asm ==="
 fasm switch.asm switch.o
@@ -88,6 +88,9 @@ for f in $SRCS; do
         continue
     fi
     obj="${f%.*}.o"
+    if [ "$f" = "isr.cpp" ]; then
+        obj="isr_cpp.o"
+    fi
     echo "  - $f -> $obj"
     g++ $CXXFLAGS "$f" -o "$obj"
     echo "  $obj: $?"
@@ -119,7 +122,7 @@ ls -l user_prog.bin user_prog_blob.o
 echo "=== Enlazando kernel ==="
 ld -m elf_i386 -T linker.ld -e _start --oformat binary \
    -o kernel.bin \
-   entry.o isr.o kernel.o screen.o idt.o \
+   entry.o isr_asm.o isr_cpp.o kernel.o screen.o idt.o \
    pic.o pit.o keyboard.o mouse.o shell.o heap.o rtc.o \
    ramdisk.o mfs.o cpu_monitor.o pat.o composer.o taskbar_start.o folder.o \
    ahci.o disk.o \

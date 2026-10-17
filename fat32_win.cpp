@@ -1,5 +1,6 @@
-// fat32_win.cpp - Etapa 4
-// Anade fat32_list para listar el directorio raiz.
+// fat32_win.cpp
+// Implementacion completa de FAT32 (solo lectura).
+// Incluye fat32_scan() que busca y monta automaticamente la FAT32.
 
 #include "fat32.h"
 #include "ahci.h"
@@ -148,17 +149,142 @@ static uint32_t dir_entry_cluster(const Fat32DirEntry *e) {
     return ((uint32_t)e->first_cluster_hi << 16) | e->first_cluster_lo;
 }
 
-// --- fat32_list (solo directorio raiz) ---
+// =====================================================================
+// Helper para validar si un sector contiene un BPB de FAT32 valido
+// =====================================================================
+static int is_valid_fat32_bpb(const uint8_t *buf) {
+    // 1. Firma de sector de arranque
+    if (buf[510] != 0x55 || buf[511] != 0xAA) return 0;
 
+    // 2. Bytes por sector (debe ser 512 en offset 0x0B)
+    uint16_t bps = (uint16_t)buf[0x0B] | ((uint16_t)buf[0x0C] << 8);
+    if (bps != 512) return 0;
+
+    // 3. Estructura tipica de FAT32
+    uint8_t  spc     = buf[0x0D];
+    uint16_t rootent = (uint16_t)buf[0x11] | ((uint16_t)buf[0x12] << 8);
+    uint16_t tot16   = (uint16_t)buf[0x13] | ((uint16_t)buf[0x14] << 8);
+    uint16_t fat16   = (uint16_t)buf[0x16] | ((uint16_t)buf[0x17] << 8);
+    uint32_t fat32   = (uint32_t)buf[0x24] | ((uint32_t)buf[0x25] << 8) |
+                       ((uint32_t)buf[0x26] << 16) | ((uint32_t)buf[0x27] << 24);
+    uint32_t rootcl  = (uint32_t)buf[0x2C] | ((uint32_t)buf[0x2D] << 8) |
+                       ((uint32_t)buf[0x2E] << 16) | ((uint32_t)buf[0x2F] << 24);
+
+    if (spc == 0 || spc > 128) return 0;  // Cluster > 64 KB no es valido
+    if (rootent != 0) return 0;           // En FAT32 es 0
+    if (tot16 != 0) return 0;             // En FAT32 es 0
+    if (fat16 != 0) return 0;             // En FAT32 es 0
+    if (fat32 == 0) return 0;             // Debe haber tamano de FAT32
+    if (rootcl < 2) return 0;             // Root cluster debe ser >= 2
+
+    return 1;
+}
+
+// =====================================================================
+// Escaneo automatico: busca la primera particion FAT32 en el disco.
+// Devuelve el LBA donde la encontro, o 0 si no hay.
+// =====================================================================
+extern "C" uint32_t fat32_scan(void)
+{
+    if (!ahci_is_ready()) return 0;
+    uint64_t total = ahci_get_sector_count();
+    if (total == 0) return 0;
+
+    kprintf("[FAT32] scan: buscando particion FAT32...\n");
+
+    // Escaneo cada 1 MB (2048 sectores)
+    for (uint64_t lba = 2048; lba < total; lba += 2048) {
+        if (!ahci_read_sector(lba, g_sector_buf)) continue;
+        if (is_valid_fat32_bpb(g_sector_buf)) {
+            kprintf("[FAT32] scan: FAT32 encontrada en LBA %u\n", (uint32_t)lba);
+            return (uint32_t)lba;
+        }
+    }
+
+    // Si no la encuentra en 1 MB, escanea sector a sector los primeros 64 MB
+    uint64_t limit = (total < 131072) ? total : 131072;
+    for (uint64_t lba = 0; lba < limit; lba++) {
+        if (!ahci_read_sector(lba, g_sector_buf)) continue;
+        if (is_valid_fat32_bpb(g_sector_buf)) {
+            kprintf("[FAT32] scan: FAT32 encontrada en LBA %u\n", (uint32_t)lba);
+            return (uint32_t)lba;
+        }
+    }
+
+    kprintf("[FAT32] scan: no se encontro ninguna FAT32\n");
+    return 0;
+}
+
+// =====================================================================
+// fat32_mount: monta la particion FAT32 en el LBA indicado.
+// =====================================================================
+extern "C" int fat32_mount(uint32_t part_lba)
+{
+    fat32_unmount();
+
+    if (!ahci_is_ready()) return 0;
+    if (!ahci_read_sector((uint64_t)part_lba, g_sector_buf)) return 0;
+
+    if (!is_valid_fat32_bpb(g_sector_buf)) {
+        kprintf("[FAT32] mount: BPB invalido en LBA %u\n", part_lba);
+        return 0;
+    }
+
+    Fat32Bpb *bpb = (Fat32Bpb *)g_sector_buf;
+
+    g_vol.mounted             = 1;
+    g_vol.part_lba            = part_lba;
+    g_vol.bytes_per_sector    = bpb->bytes_per_sector;
+    g_vol.sectors_per_cluster = bpb->sectors_per_cluster;
+    g_vol.bytes_per_cluster   = (uint32_t)bpb->bytes_per_sector * bpb->sectors_per_cluster;
+    g_vol.reserved_sectors    = bpb->reserved_sectors;
+    g_vol.num_fats            = bpb->num_fats;
+    g_vol.fat_size_sectors    = bpb->fat_size_32;
+    g_vol.root_cluster        = bpb->root_cluster;
+    g_vol.first_fat_sector    = bpb->reserved_sectors;
+    g_vol.first_data_sector   = bpb->reserved_sectors +
+                                bpb->num_fats * bpb->fat_size_32;
+
+    uint32_t total_sectors = bpb->total_sectors_32;
+    if (total_sectors == 0) total_sectors = bpb->total_sectors_16;
+    if (total_sectors > g_vol.first_data_sector) {
+        g_vol.total_clusters = (total_sectors - g_vol.first_data_sector) /
+                               bpb->sectors_per_cluster;
+    } else {
+        g_vol.total_clusters = 0;
+    }
+
+    for (int i = 0; i < 11; i++) g_vol.volume_label[i] = bpb->volume_label[i];
+    g_vol.volume_label[11] = 0;
+    for (int i = 0; i < 8; i++) g_vol.fs_type[i] = bpb->fs_type[i];
+    g_vol.fs_type[8] = 0;
+
+    g_cluster_buf_size = g_vol.bytes_per_cluster;
+    if (g_cluster_buf_size == 0 || g_cluster_buf_size > 65536) {
+        g_vol.mounted = 0;
+        g_cluster_buf_size = 0;
+        return 0;
+    }
+
+    g_cluster_buf = (uint8_t *)kmalloc(g_cluster_buf_size);
+    if (!g_cluster_buf) {
+        g_vol.mounted = 0;
+        g_cluster_buf_size = 0;
+        return 0;
+    }
+
+    return 1;
+}
+
+// =====================================================================
+// fat32_list: lista el contenido de un directorio.
+// =====================================================================
 extern "C" int fat32_list(const char *path, fat32_list_cb cb)
 {
     if (!g_vol.mounted || !cb || !g_cluster_buf) return 0;
 
-    kprintf("[FAT32] list: inicio\n");
-
-    // Solo soportamos "/" por ahora. Cualquier otra ruta devuelve 0.
+    // Solo soportamos el directorio raiz "/"
     if (path && *path && !(path[0] == '/' && path[1] == 0)) {
-        kprintf("[FAT32] list: solo se soporta /\n");
         return 0;
     }
 
@@ -169,12 +295,7 @@ extern "C" int fat32_list(const char *path, fat32_list_cb cb)
     int  lfn_active = 0;
 
     while (cluster >= 2 && cluster < FAT32_CLUSTER_EOC && safety < 100) {
-        kprintf("[FAT32] list: leyendo cluster %u\n", cluster);
-
-        if (!read_cluster(cluster, g_cluster_buf)) {
-            kprintf("[FAT32] list: fallo leyendo cluster\n");
-            return 0;
-        }
+        if (!read_cluster(cluster, g_cluster_buf)) return 0;
 
         uint32_t entries = g_vol.bytes_per_cluster / 32;
         Fat32DirEntry *dir = (Fat32DirEntry *)g_cluster_buf;
@@ -223,75 +344,12 @@ extern "C" int fat32_list(const char *path, fat32_list_cb cb)
         cluster = fat_next(cluster);
         safety++;
     }
-    kprintf("[FAT32] list: fin\n");
     return 1;
 }
 
-// --- fat32_mount (igual que Etapa 3) ---
-
-extern "C" int fat32_mount(uint32_t part_lba)
-{
-    fat32_unmount();
-
-    if (!ahci_is_ready()) return 0;
-    if (!ahci_read_sector((uint64_t)part_lba, g_sector_buf)) return 0;
-
-    Fat32Bpb *bpb = (Fat32Bpb *)g_sector_buf;
-    if (bpb->signature != 0xAA55) return 0;
-    if (bpb->bytes_per_sector != 512) return 0;
-
-    int is_fat32 = 0;
-    for (int i = 0; i < 8; i++) {
-        if (bpb->fs_type[i] == 'F' && bpb->fs_type[i+1] == 'A' &&
-            bpb->fs_type[i+2] == 'T' && bpb->fs_type[i+3] == '3' &&
-            bpb->fs_type[i+4] == '2') { is_fat32 = 1; break; }
-    }
-    if (bpb->fat_size_16 == 0 && bpb->fat_size_32 > 0) is_fat32 = 1;
-    if (!is_fat32) return 0;
-
-    g_vol.mounted             = 1;
-    g_vol.part_lba            = part_lba;
-    g_vol.bytes_per_sector    = bpb->bytes_per_sector;
-    g_vol.sectors_per_cluster = bpb->sectors_per_cluster;
-    g_vol.bytes_per_cluster   = (uint32_t)bpb->bytes_per_sector * bpb->sectors_per_cluster;
-    g_vol.reserved_sectors    = bpb->reserved_sectors;
-    g_vol.num_fats            = bpb->num_fats;
-    g_vol.fat_size_sectors    = bpb->fat_size_32;
-    g_vol.root_cluster        = bpb->root_cluster;
-    g_vol.first_fat_sector    = bpb->reserved_sectors;
-    g_vol.first_data_sector   = bpb->reserved_sectors +
-                                bpb->num_fats * bpb->fat_size_32;
-
-    uint32_t total_sectors = bpb->total_sectors_32;
-    if (total_sectors == 0) total_sectors = bpb->total_sectors_16;
-    if (total_sectors > g_vol.first_data_sector) {
-        g_vol.total_clusters = (total_sectors - g_vol.first_data_sector) /
-                               bpb->sectors_per_cluster;
-    } else {
-        g_vol.total_clusters = 0;
-    }
-
-    for (int i = 0; i < 11; i++) g_vol.volume_label[i] = bpb->volume_label[i];
-    g_vol.volume_label[11] = 0;
-    for (int i = 0; i < 8; i++) g_vol.fs_type[i] = bpb->fs_type[i];
-    g_vol.fs_type[8] = 0;
-
-    g_cluster_buf_size = g_vol.bytes_per_cluster;
-    if (g_cluster_buf_size == 0 || g_cluster_buf_size > 65536) {
-        g_vol.mounted = 0;
-        g_cluster_buf_size = 0;
-        return 0;
-    }
-
-    g_cluster_buf = (uint8_t *)kmalloc(g_cluster_buf_size);
-    if (!g_cluster_buf) {
-        g_vol.mounted = 0;
-        g_cluster_buf_size = 0;
-        return 0;
-    }
-    return 1;
-}
-
+// =====================================================================
+// Resto de la API (stubs por ahora)
+// =====================================================================
 extern "C" void fat32_unmount(void) {
     if (g_cluster_buf) {
         kfree(g_cluster_buf);

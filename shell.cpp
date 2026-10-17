@@ -27,17 +27,11 @@ static unsigned int str_len(const char *s);
  * Linea de entrada por terminal
  * ===================================================================== */
 #define TERM_LINE_MAX 64
-#define EDIT_BUF_MAX  3800
 
 typedef struct {
     int  wid;
     char line[TERM_LINE_MAX];
     int  len;
-
-    int  editing;
-    char edit_name[16];
-    int  edit_len;
-    char edit_buf[EDIT_BUF_MAX];
 } ShellTerm;
 
 static ShellTerm terms[SHELL_MAX_TERMS];
@@ -100,111 +94,6 @@ void print_uint(int wid, unsigned int v) {
 }
 
 /* =====================================================================
- * Editor grafico
- * ===================================================================== */
-static void editor_draw(int wid, ShellTerm *t) {
-    win_sys_clear(wid);
-
-    term_print(wid, "=== EDITOR: ");
-    term_print(wid, t->edit_name);
-    term_println(wid, " ===");
-    term_println(wid, "Ctrl+S=guardar  ESC=salir");
-    term_println(wid, "-----------------------------");
-
-    if (t->edit_len == 0) {
-        term_println(wid, "(vacio)");
-    } else {
-        win_sys_write(wid, t->edit_buf, t->edit_len);
-    }
-
-    composer_dirty_window(wid);
-}
-
-static int editor_open(int x, int y, int w, int h, const char *name) {
-    int slot = -1;
-    for (int i = 0; i < SHELL_MAX_TERMS; i++) {
-        if (terms[i].wid < 0) { slot = i; break; }
-    }
-    if (slot < 0) return -1;
-
-    char title[32];
-    title[0] = 'E'; title[1] = 'd'; title[2] = 'i'; title[3] = 't';
-    title[4] = ':'; title[5] = ' ';
-    int k = 6;
-    int n = 0;
-    while (name[n] && k < 30) { title[k++] = name[n++]; }
-    title[k] = 0;
-
-    int wid = win_sys_create(x, y, w, h, title);
-    if (wid < 0) return -1;
-
-    win_focus(wid);
-
-    ShellTerm *t = &terms[slot];
-    t->wid = wid;
-    t->len = 0;
-    t->line[0] = 0;
-    t->editing = 1;
-
-    k = 0;
-    while (name[k] && k < 15) { t->edit_name[k] = name[k]; k++; }
-    t->edit_name[k] = 0;
-
-    int r = mfs_read_file(t->edit_name, t->edit_buf, EDIT_BUF_MAX - 1);
-    if (r < 0) t->edit_len = 0;
-    else       t->edit_len = r;
-
-    editor_draw(wid, t);
-    composer_dirty_window(wid);
-    return wid;
-}
-
-static void editor_handle_key(int wid, ShellTerm *t, char c) {
-    if (c == 27) {   /* ESC */
-        composer_dirty_window(wid);
-        t->wid = -1;
-        t->editing = 0;
-        win_sys_destroy(wid);
-        return;
-    }
-
-    if (c == 19) {   /* Ctrl+S */
-        int r = mfs_write_file(t->edit_name, t->edit_buf, t->edit_len);
-        if (r < 0) {
-            editor_draw(wid, t);
-            term_println(wid, "\nERROR al guardar");
-        } else {
-            editor_draw(wid, t);
-            term_println(wid, "\nGuardado.");
-        }
-        return;
-    }
-
-    if (c == '\b') {
-        if (t->edit_len > 0) {
-            t->edit_len--;
-            editor_draw(wid, t);
-        }
-        return;
-    }
-
-    if (c == '\n') {
-        if (t->edit_len < EDIT_BUF_MAX - 1) {
-            t->edit_buf[t->edit_len++] = '\n';
-            editor_draw(wid, t);
-        }
-        return;
-    }
-
-    if (c >= 32 && c < 127) {
-        if (t->edit_len < EDIT_BUF_MAX - 1) {
-            t->edit_buf[t->edit_len++] = c;
-            editor_draw(wid, t);
-        }
-    }
-}
-
-/* =====================================================================
  * Comandos
  * ===================================================================== */
 static void cmd_help(int wid) {
@@ -221,10 +110,9 @@ static void cmd_help(int wid) {
     term_println(wid, "  write <n> <texto> - escribir en archivo");
     term_println(wid, "  rm <n>     - borrar archivo");
     term_println(wid, "  df         - uso del ramdisk");
-    term_println(wid, "  edit <n>   - editor grafico");
     term_println(wid, "  files      - gestor grafico de archivos");
     term_println(wid, "  disk       - estado del disco AHCI");
-    term_println(wid, "  partitions - lista particiones del MBR");
+    term_println(wid, "  partitions - lista particiones");
     term_println(wid, "  hex <lba>  - volcar 512 bytes de un sector");
     term_println(wid, "  close      - cerrar esta ventana");
     term_println(wid, "  reboot     - reiniciar");
@@ -358,27 +246,6 @@ static void cmd_df(int wid) {
     term_print(wid, "Archivos: "); print_uint(wid, (unsigned int)n); term_println(wid, "");
 }
 
-static void cmd_edit(int shell_wid, const char *name) {
-    if (!mfs_mounted()) { term_println(shell_wid, "fs: no montado"); return; }
-    if (!name || !*name) { term_println(shell_wid, "uso: edit <nombre>"); return; }
-
-    if (!mfs_exists(name)) {
-        if (mfs_create(name) != 0) {
-            term_println(shell_wid, "edit: no se pudo crear");
-            return;
-        }
-    }
-
-    int wid = editor_open(80, 80, 460, 340, name);
-    if (wid < 0) {
-        term_println(shell_wid, "edit: no hay slots libres");
-        return;
-    }
-
-    term_print(shell_wid, "edit: abriendo ");
-    term_println(shell_wid, name);
-}
-
 static void cmd_files(int wid) {
     if (folder_open(120, 100, 400, 320) < 0) {
         term_println(wid, "files: no se pudo abrir");
@@ -412,7 +279,6 @@ static void cmd_execute(int wid, ShellTerm *t, const char *cmd) {
     else if (str_starts_with(cmd, "cat "))   cmd_cat(wid, cmd + 4);
     else if (str_starts_with(cmd, "write ")) cmd_write(wid, cmd + 6);
     else if (str_starts_with(cmd, "rm "))    cmd_rm(wid, cmd + 3);
-    else if (str_starts_with(cmd, "edit "))  cmd_edit(wid, cmd + 5);
     else if (str_eq(cmd, "close")) {
         composer_dirty_window(wid);
         t->wid = -1;
@@ -436,9 +302,6 @@ extern "C" int shell_init(void) {
         terms[i].wid = -1;
         terms[i].len = 0;
         terms[i].line[0] = 0;
-        terms[i].editing = 0;
-        terms[i].edit_len = 0;
-        terms[i].edit_name[0] = 0;
     }
     shell_ready = 1;
 
@@ -465,9 +328,6 @@ extern "C" int shell_new_terminal(int x, int y, int w, int h, const char *title)
     terms[slot].wid = wid;
     terms[slot].len = 0;
     terms[slot].line[0] = 0;
-    terms[slot].editing = 0;
-    terms[slot].edit_len = 0;
-    terms[slot].edit_name[0] = 0;
 
     term_println(wid, "MiniSO - Terminal grafica");
     term_println(wid, "Escribe 'help' para ver comandos");
@@ -492,19 +352,7 @@ extern "C" void shell_handle_key(int wid, char c) {
     }
     if (!t) return;
 
-    if (t->editing) {
-        editor_handle_key(wid, t, c);
-        return;
-    }
-
-    /* ================================================================
-     * SCROLL: Page Up / Page Down
-     * ================================================================
-     * Scancodes estandar PS/2:
-     *   Page Up   = 0x49
-     *   Page Down = 0x51
-     * Si tu driver los traduce a otros valores, ajustalos aqui.
-     * ================================================================ */
+    /* Scroll: Page Up / Page Down */
     if (c == 0x49) {  /* Page Up */
         win_sys_scroll_up(wid);
         composer_dirty_window(wid);
@@ -552,7 +400,6 @@ extern "C" void shell_close_terminal(int wid) {
         if (terms[i].wid == wid) {
             terms[i].wid = -1;
             terms[i].len = 0;
-            terms[i].editing = 0;
             return;
         }
     }
