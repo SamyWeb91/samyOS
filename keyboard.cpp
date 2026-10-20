@@ -17,15 +17,13 @@ static volatile int kbuf_tail = 0;
 static volatile int k_shift = 0;
 static volatile int k_ctrl  = 0;
 static volatile int k_alt   = 0;
+static volatile int k_caps  = 0; // <-- Nuevo: estado de Caps Lock
 
 /* Prefijo E0 (teclas extendidas: flechas, ctrl derecho, etc.) */
 static volatile int kbd_extended = 0;
 
 /* =====================================================================
  * Tablas de scancode -> ASCII (Set 1)
- *
- * Verificadas: 128 entradas cada una. El comentario /* XX *​/ indica
- * el indice (en hex) de la siguiente entrada.
  * ===================================================================== */
 static const char kbd_us[128] = {
     /* 00 */ 0, 27,
@@ -107,7 +105,6 @@ static const char kbd_us_shift[128] = {
     /* 78 */ 0,0,0,0,0,0,0,0
 };
 
-/* Verificacion en tiempo de compilacion: si el tamano no es 128, falla */
 typedef char check_kbd_us_size[(sizeof(kbd_us) == 128) ? 1 : -1];
 typedef char check_kbd_us_shift_size[(sizeof(kbd_us_shift) == 128) ? 1 : -1];
 
@@ -139,6 +136,7 @@ void keyboard_init() {
     k_shift = 0;
     k_ctrl  = 0;
     k_alt   = 0;
+    k_caps  = 0;
     kbd_extended = 0;
 }
 
@@ -162,9 +160,10 @@ extern "C" void keyboard_handler() {
 
     /* Modificadores sin E0 */
     if (!kbd_extended) {
-        if (code == 0x2A || code == 0x36) { k_shift = !is_release; return; }
-        if (code == 0x1D)                 { k_ctrl  = !is_release; return; }
-        if (code == 0x38)                 { k_alt   = !is_release; return; }
+        if (code == 0x2A || code == 0x36) { k_shift = !is_release; return; } // Shift
+        if (code == 0x1D)                 { k_ctrl  = !is_release; return; } // Ctrl
+        if (code == 0x38)                 { k_alt   = !is_release; return; } // Alt
+        if (code == 0x3A && !is_release)  { k_caps  = !k_caps; return; }     // Caps Lock
     } else {
         /* Modificadores con E0 */
         if (code == 0x1D) { k_ctrl = !is_release; kbd_extended = 0; return; }
@@ -187,15 +186,28 @@ extern "C" void keyboard_handler() {
     char c = kbd_us[code];
     if (c == 0) return;
 
+    // Aplicar Ctrl
     if (k_ctrl) {
         c = apply_ctrl(c);
         kbuf_push(c);
         return;
     }
 
-    if (k_shift) {
-        char cs = kbd_us_shift[code];
-        if (cs != 0) c = cs;
+    // Lógica combinada de Shift y Caps Lock
+    // Si es una letra (a-z):
+    if (c >= 'a' && c <= 'z') {
+        // Si (Shift XOR Caps Lock) es verdadero, la letra es mayúscula
+        if (k_shift ^ k_caps) {
+            c = kbd_us_shift[code]; // Buscar la versión mayúscula en la tabla shift
+        }
+    } 
+    // Si NO es una letra (es un número o símbolo):
+    else {
+        // Solo nos importa si Shift está presionado
+        if (k_shift) {
+            char cs = kbd_us_shift[code];
+            if (cs != 0) c = cs;
+        }
     }
 
     kbuf_push(c);

@@ -4,13 +4,11 @@
 #include "screen.h"
 #include "rtc.h"
 #include "pit.h"
-#include "ramdisk.h"
-#include "libc.h"
 #include "composer.h"
-#include "mfs.h"
 #include "folder.h"
 #include "ahci.h"
 #include "disk.h"
+#include "fat32.h"
 
 /* =====================================================================
  * Forward declarations
@@ -94,6 +92,24 @@ void print_uint(int wid, unsigned int v) {
 }
 
 /* =====================================================================
+ * Callback para listar FAT32
+ * ===================================================================== */
+static void fat32_shell_list_cb(const char *name, uint32_t size, uint8_t attr, uint32_t cluster) {
+    (void)cluster;
+    int wid = win_get_focused();
+
+    term_print(wid, "  ");
+    term_print(wid, name);
+    for (unsigned int k = str_len(name); k < 20; k++) term_print(wid, " ");
+    if (attr & FAT32_ATTR_DIRECTORY) {
+        term_println(wid, "<DIR>");
+    } else {
+        print_uint(wid, size);
+        term_println(wid, " bytes");
+    }
+}
+
+/* =====================================================================
  * Comandos
  * ===================================================================== */
 static void cmd_help(int wid) {
@@ -101,157 +117,77 @@ static void cmd_help(int wid) {
     term_println(wid, "  help       - esta ayuda");
     term_println(wid, "  clear      - limpiar terminal");
     term_println(wid, "  date       - fecha y hora");
-    term_println(wid, "  ticks      - ticks del sistema");
-    term_println(wid, "  uptime     - tiempo desde arranque");
-    term_println(wid, "  echo ...   - imprimir texto");
-    term_println(wid, "  ls         - listar archivos");
-    term_println(wid, "  touch <n>  - crear archivo vacio");
-    term_println(wid, "  cat <n>    - mostrar contenido");
-    term_println(wid, "  write <n> <texto> - escribir en archivo");
-    term_println(wid, "  rm <n>     - borrar archivo");
-    term_println(wid, "  df         - uso del ramdisk");
     term_println(wid, "  files      - gestor grafico de archivos");
+    term_println(wid, "  ls         - listar archivos (FAT32)");
+    term_println(wid, "  cat <n>    - mostrar archivo (FAT32)");
+    term_println(wid, "  info       - info de FAT32 montada");
     term_println(wid, "  disk       - estado del disco AHCI");
     term_println(wid, "  partitions - lista particiones");
-    term_println(wid, "  hex <lba>  - volcar 512 bytes de un sector");
+    term_println(wid, "  hex <lba>  - volcar sector");
     term_println(wid, "  close      - cerrar esta ventana");
-    term_println(wid, "  reboot     - reiniciar");
-    term_println(wid, "");
-    term_println(wid, "Scroll: PageUp / PageDown");
 }
 
 static void cmd_date(int wid) {
     RTCTime t; rtc_read(&t);
-    char buf[48];
+    char buf[20];
     buf[0] = '0' + (t.day/10); buf[1] = '0' + (t.day%10); buf[2] = '/';
     buf[3] = '0' + (t.month/10); buf[4] = '0' + (t.month%10); buf[5] = '/';
     buf[6] = '0' + ((t.year/1000)%10); buf[7] = '0' + ((t.year/100)%10);
     buf[8] = '0' + ((t.year/10)%10); buf[9] = '0' + (t.year%10);
     buf[10] = ' '; buf[11] = '0' + (t.hour/10); buf[12] = '0' + (t.hour%10);
     buf[13] = ':'; buf[14] = '0' + (t.minute/10); buf[15] = '0' + (t.minute%10);
-    buf[16] = ':'; buf[17] = '0' + (t.second/10); buf[18] = '0' + (t.second%10);
-    buf[19] = 0;
+    buf[16] = 0;
     term_println(wid, buf);
 }
 
-static void cmd_ticks(int wid) {
-    unsigned int t = pit_get_ticks();
-    char tmp[12];
-    int n = 0;
-    if (t == 0) tmp[n++] = '0';
-    else { while (t) { tmp[n++] = '0' + (t % 10); t /= 10; } }
-    char buf[24];
-    buf[0] = 'T'; buf[1] = 'i'; buf[2] = 'c'; buf[3] = 'k';
-    buf[4] = 's'; buf[5] = ':'; buf[6] = ' ';
-    for (int k = 0; k < n; k++) buf[7 + k] = tmp[n - 1 - k];
-    buf[7 + n] = 0;
-    term_println(wid, buf);
+static void cmd_files(int wid) {
+    if (folder_open(120, 100, 400, 320) < 0)
+        term_println(wid, "files: no se pudo abrir");
+    else
+        term_println(wid, "files: abriendo gestor");
 }
 
-static void cmd_uptime(int wid) {
-    unsigned int t = pit_get_ticks() / 100;
-    unsigned int h = t / 3600;
-    unsigned int m = (t % 3600) / 60;
-    unsigned int s = t % 60;
-    char buf[20];
-    buf[0] = '0' + (h / 10); buf[1] = '0' + (h % 10); buf[2] = ':';
-    buf[3] = '0' + (m / 10); buf[4] = '0' + (m % 10); buf[5] = ':';
-    buf[6] = '0' + (s / 10); buf[7] = '0' + (s % 10); buf[8] = 0;
-    term_print(wid, "Uptime: ");
-    term_println(wid, buf);
-}
-
-static void cmd_ls(int wid) {
-    if (!mfs_mounted()) { term_println(wid, "fs: no montado"); return; }
-
-    int n = mfs_count();
-    if (n == 0) { term_println(wid, "  (vacio)"); return; }
-
-    for (int i = 0; i < n; i++) {
-        char name[16];
-        unsigned int size = 0;
-        if (mfs_get(i, name, &size) != 0) continue;
-
-        term_print(wid, "  ");
-        term_print(wid, name);
-        for (unsigned int k = str_len(name); k < 12; k++) term_print(wid, " ");
-        print_uint(wid, size);
-        term_println(wid, " bytes");
+static void cmd_fatls(int wid, const char *path) {
+    if (!fat32_is_mounted()) {
+        term_println(wid, "ls: FAT32 no montada");
+        return;
     }
+    if (!path || !*path) path = "/";
+    if (!fat32_list(path, fat32_shell_list_cb))
+        term_println(wid, "ls: error al listar");
 }
 
-static void cmd_touch(int wid, const char *name) {
-    if (!mfs_mounted()) { term_println(wid, "fs: no montado"); return; }
-    if (!name || !*name) { term_println(wid, "uso: touch <nombre>"); return; }
+static void cmd_fatcat(int wid, const char *name) {
+    if (!fat32_is_mounted()) {
+        term_println(wid, "cat: FAT32 no montada");
+        return;
+    }
+    if (!name || !*name) {
+        term_println(wid, "uso: cat <archivo>");
+        return;
+    }
 
-    int r = mfs_create(name);
-    if (r == -2)      term_println(wid, "touch: ya existe");
-    else if (r < 0)   term_println(wid, "touch: error");
-    else              term_println(wid, "touch: ok");
-}
-
-static void cmd_cat(int wid, const char *name) {
-    if (!mfs_mounted()) { term_println(wid, "fs: no montado"); return; }
-    if (!name || !*name) { term_println(wid, "uso: cat <nombre>"); return; }
-
-    char buf[512];
-    int r = mfs_read_file(name, buf, sizeof(buf) - 1);
-    if (r < 0) { term_println(wid, "cat: no existe"); return; }
+    static char buf[512]; // Estático para no inflar el stack
+    int r = fat32_read_file(name, buf, sizeof(buf) - 1);
+    if (r < 0) {
+        term_println(wid, "cat: error al leer archivo");
+        return;
+    }
     buf[r] = 0;
     term_println(wid, buf);
 }
 
-static void cmd_write(int wid, const char *rest) {
-    if (!mfs_mounted()) { term_println(wid, "fs: no montado"); return; }
-
-    char name[16];
-    int i = 0;
-    while (rest[i] && rest[i] != ' ' && i < 15) { name[i] = rest[i]; i++; }
-    name[i] = 0;
-
-    if (i == 0) { term_println(wid, "uso: write <nombre> <texto>"); return; }
-
-    while (rest[i] == ' ') i++;
-    const char *text = rest + i;
-
-    int r = mfs_write_file(name, text, str_len(text));
-    if (r < 0) term_println(wid, "write: error");
-    else       term_println(wid, "write: ok");
-}
-
-static void cmd_rm(int wid, const char *name) {
-    if (!mfs_mounted()) { term_println(wid, "fs: no montado"); return; }
-    if (!name || !*name) { term_println(wid, "uso: rm <nombre>"); return; }
-
-    int r = mfs_delete(name);
-    if (r < 0) term_println(wid, "rm: no existe");
-    else       term_println(wid, "rm: ok");
-}
-
-static void cmd_df(int wid) {
-    if (!mfs_mounted()) { term_println(wid, "fs: no montado"); return; }
-
-    unsigned int total = ramdisk_size(MFS_RD_ID);
-    unsigned int used = 0;
-    int n = mfs_count();
-    for (int i = 0; i < n; i++) {
-        char name[16];
-        unsigned int size = 0;
-        if (mfs_get(i, name, &size) == 0) used += size;
+static void cmd_fatinfo(int wid) {
+    if (!fat32_is_mounted()) {
+        term_println(wid, "info: FAT32 no montada");
+        return;
     }
+    const Fat32Volume *v = fat32_get_volume();
+    if (!v) return;
 
-    term_print(wid, "Total:  "); print_uint(wid, total);     term_println(wid, " bytes");
-    term_print(wid, "Datos:  "); print_uint(wid, used);      term_println(wid, " bytes usados");
-    term_print(wid, "Libre:  "); print_uint(wid, total - used); term_println(wid, " bytes");
-    term_print(wid, "Archivos: "); print_uint(wid, (unsigned int)n); term_println(wid, "");
-}
-
-static void cmd_files(int wid) {
-    if (folder_open(120, 100, 400, 320) < 0) {
-        term_println(wid, "files: no se pudo abrir");
-    } else {
-        term_println(wid, "files: abriendo gestor");
-    }
+    term_println(wid, "=== FAT32 Info ===");
+    term_print(wid, "Etiqueta: "); term_println(wid, v->volume_label);
+    term_print(wid, "LBA: "); print_uint(wid, v->part_lba); term_println(wid, "");
 }
 
 /* =====================================================================
@@ -260,33 +196,28 @@ static void cmd_files(int wid) {
 static void cmd_execute(int wid, ShellTerm *t, const char *cmd) {
     if (cmd[0] == 0) return;
 
-    /* Comandos del disco (disk.cpp) */
+    /* Comandos del disco */
     if      (str_eq(cmd, "disk"))               disk_cmd_disk(wid);
     else if (str_eq(cmd, "partitions"))         disk_cmd_partitions(wid);
     else if (str_starts_with(cmd, "hex "))      disk_cmd_hex(wid, cmd + 4);
 
-    /* Resto de comandos del shell */
+    /* Comandos de FAT32 (renombrados a ls, cat, info) */
+    else if (str_eq(cmd, "ls"))                 cmd_fatls(wid, "/");
+    else if (str_starts_with(cmd, "ls "))       cmd_fatls(wid, cmd + 3);
+    else if (str_starts_with(cmd, "cat "))      cmd_fatcat(wid, cmd + 4);
+    else if (str_eq(cmd, "info"))               cmd_fatinfo(wid);
+
+    /* Comandos basicos */
     else if (str_eq(cmd, "help"))         cmd_help(wid);
     else if (str_eq(cmd, "clear"))        win_sys_clear(wid);
     else if (str_eq(cmd, "date"))         cmd_date(wid);
-    else if (str_eq(cmd, "ticks"))        cmd_ticks(wid);
-    else if (str_eq(cmd, "uptime"))       cmd_uptime(wid);
-    else if (str_eq(cmd, "ls"))           cmd_ls(wid);
-    else if (str_eq(cmd, "df"))           cmd_df(wid);
     else if (str_eq(cmd, "files"))        cmd_files(wid);
-    else if (str_starts_with(cmd, "echo "))  term_println(wid, cmd + 5);
-    else if (str_starts_with(cmd, "touch ")) cmd_touch(wid, cmd + 6);
-    else if (str_starts_with(cmd, "cat "))   cmd_cat(wid, cmd + 4);
-    else if (str_starts_with(cmd, "write ")) cmd_write(wid, cmd + 6);
-    else if (str_starts_with(cmd, "rm "))    cmd_rm(wid, cmd + 3);
+    
     else if (str_eq(cmd, "close")) {
         composer_dirty_window(wid);
         t->wid = -1;
         win_sys_destroy(wid);
         return;
-    }
-    else if (str_eq(cmd, "reboot")) {
-        term_println(wid, "Reiniciando...");
     }
     else {
         term_print(wid, "Desconocido: ");
@@ -304,9 +235,7 @@ extern "C" int shell_init(void) {
         terms[i].line[0] = 0;
     }
     shell_ready = 1;
-
     disk_init();
-    mfs_mount();
     return 0;
 }
 
@@ -352,7 +281,6 @@ extern "C" void shell_handle_key(int wid, char c) {
     }
     if (!t) return;
 
-    /* Scroll: Page Up / Page Down */
     if (c == 0x49) {  /* Page Up */
         win_sys_scroll_up(wid);
         composer_dirty_window(wid);
@@ -364,7 +292,6 @@ extern "C" void shell_handle_key(int wid, char c) {
         return;
     }
 
-    /* Si el usuario escribe algo, volver al fondo del scroll */
     if (c == '\n' || c == '\b' || (c >= 32 && c < 127)) {
         win_sys_scroll_reset(wid);
     }
@@ -405,7 +332,7 @@ extern "C" void shell_close_terminal(int wid) {
     }
 }
 
-/* Wrappers para que disk.cpp y otros modulos usen estas funciones */
+/* Wrappers para disk.cpp */
 extern "C" void shell_term_print(int wid, const char *s) { term_print(wid, s); }
 extern "C" void shell_term_println(int wid, const char *s) { term_println(wid, s); }
 extern "C" void shell_print_uint(int wid, unsigned int v) { print_uint(wid, v); }
