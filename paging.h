@@ -18,7 +18,7 @@ extern "C" {
 
 void paging_init();
 void paging_enable_now();
-
+void paging_flush_tlb(void); //agregada para rin3 de prueba
 void paging_map(unsigned int virt, unsigned int phys, unsigned int flags);
 void paging_map_range(unsigned int virt, unsigned int phys, unsigned int size_kb, unsigned int flags);
 

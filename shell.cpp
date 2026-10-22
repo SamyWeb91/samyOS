@@ -10,6 +10,9 @@
 #include "disk.h"
 #include "fat32.h"
 
+/* Prueba aislada de ring 3 (ring3_test.cpp) */
+extern "C" void ring3_test_run(void);
+
 /* =====================================================================
  * Forward declarations
  * ===================================================================== */
@@ -124,6 +127,7 @@ static void cmd_help(int wid) {
     term_println(wid, "  disk       - estado del disco AHCI");
     term_println(wid, "  partitions - lista particiones");
     term_println(wid, "  hex <lba>  - volcar sector");
+    term_println(wid, "  ring3      - prueba de ring 3");
     term_println(wid, "  close      - cerrar esta ventana");
 }
 
@@ -212,7 +216,10 @@ static void cmd_execute(int wid, ShellTerm *t, const char *cmd) {
     else if (str_eq(cmd, "clear"))        win_sys_clear(wid);
     else if (str_eq(cmd, "date"))         cmd_date(wid);
     else if (str_eq(cmd, "files"))        cmd_files(wid);
-    
+
+    /* Prueba de ring 3 */
+    else if (str_eq(cmd, "ring3"))        ring3_test_run();
+
     else if (str_eq(cmd, "close")) {
         composer_dirty_window(wid);
         t->wid = -1;

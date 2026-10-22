@@ -1,3 +1,4 @@
+// paging.cpp
 #include "paging.h"
 #include "screen.h"
 
@@ -16,16 +17,9 @@ extern "C" void paging_init() {
         page_table_0[i]   = 0;
     }
 
-    // Mapear los primeros 128 MB de RAM linealmente (identidad).
-    // 128 MB = 32 page tables de 4 MB cada una.
-    // Cubre kernel + heap + backbuffer + espacio de sobra.
-    //
-    // IMPORTANTE: se mapea con PTE_PRESENT | PTE_RW, sin PTE_USER.
-    // El user code NO puede acceder a esta zona directamente.
-    // Si en el futuro quieres userland, usa paging_map con PTE_USER
-    // para las páginas concretas que necesites.
-
-    int PTs_needed = 32;   // 32 PTs * 4 MB = 128 MB
+    // Mapear los primeros 128 MB de RAM linealmente (identidad) en ring 0.
+    // 32 page tables * 4 MB = 128 MB
+    int PTs_needed = 32;   
     if (PTs_needed > PT_POOL_SIZE) PTs_needed = PT_POOL_SIZE;
 
     for (int pt_i = 0; pt_i < PTs_needed; pt_i++) {
@@ -36,7 +30,7 @@ extern "C" void paging_init() {
             pt = pt_pool[pt_i];
         }
 
-        // Cada entry cubre 4 KB. Base física = pt_i * 4 MB.
+        // Base física = pt_i * 4 MB.
         unsigned int base_phys = pt_i * 0x400000;
 
         for (int i = 0; i < 1024; i++) {
@@ -65,27 +59,42 @@ extern "C" void paging_map(unsigned int virt, unsigned int phys, unsigned int fl
         for (int i = 0; i < 1024; i++) new_pt[i] = 0;
 
         unsigned int pde_flags = PTE_PRESENT | PTE_RW;
-        if (flags & PTE_USER) {
-            pde_flags |= PTE_USER;
-        }
+        if (flags & PTE_USER) pde_flags |= PTE_USER;
         page_directory[pd_index] = ((unsigned int)new_pt) | pde_flags;
     } else {
+        // CRÍTICO: Si el PDE ya existe, pero el llamador pide PTE_USER,
+        // hay que añadírselo al PDE también (los permisos son jerárquicos).
         if ((flags & PTE_USER) && !(page_directory[pd_index] & PTE_USER)) {
             page_directory[pd_index] |= PTE_USER;
         }
     }
 
     unsigned int *pt = (unsigned int*)(page_directory[pd_index] & 0xFFFFF000);
-    pt[pt_index] = (phys & 0xFFFFF000) | (flags & 0xFFF) | PTE_PRESENT;
+    
+    // Escribir el PTE: preservar flags anteriores si el nuevo no los tiene
+    unsigned int new_pte = (phys & 0xFFFFF000) | PTE_PRESENT;
+    if (flags & PTE_RW)   new_pte |= PTE_RW;
+    if (flags & PTE_USER) new_pte |= PTE_USER;
+    pt[pt_index] = new_pte;
 
     asm volatile("invlpg (%0)" : : "r"(virt) : "memory");
 }
 
+// CORREGIDO: size_kb se convierte a número de páginas (4KB cada una).
 extern "C" void paging_map_range(unsigned int virt, unsigned int phys, unsigned int size_kb, unsigned int flags) {
-    for (unsigned int i = 0; i < size_kb; i++) {
+    unsigned int pages = (size_kb * 1024) / 4096; // Convertir KB a páginas
+    if (pages == 0) pages = 1;
+    
+    for (unsigned int i = 0; i < pages; i++) {
         paging_map(virt + i * 0x1000, phys + i * 0x1000, flags);
     }
 }
 
 extern "C" unsigned int paging_get_pd_addr()  { return (unsigned int)page_directory; }
 extern "C" unsigned int paging_get_pt0_addr() { return (unsigned int)page_table_0; }
+
+extern "C" void paging_flush_tlb(void) {
+    unsigned int cr3;
+    asm volatile("mov %%cr3, %0" : "=r"(cr3));
+    asm volatile("mov %0, %%cr3" :: "r"(cr3) : "memory");
+}
