@@ -1,68 +1,48 @@
 #include "idt.h"
 #include "screen.h"
 
-static IDTEntry idt[256];
+// FIX: alinear la IDT a 16 bytes (recomendado por Intel; lidt no lo
+// exige pero mejora el rendimiento y evita problemas con algunos
+// emuladores).
+static IDTEntry idt[256] __attribute__((aligned(16)));
 static IDTPtr idt_ptr;
 
 // =====================================================================
 // Declaraciones externas de los stubs en isr.asm
 // =====================================================================
-extern "C" void isr_0();
-extern "C" void isr_1();
-extern "C" void isr_2();
-extern "C" void isr_3();
-extern "C" void isr_4();
-extern "C" void isr_5();
-extern "C" void isr_6();
-extern "C" void isr_7();
-extern "C" void isr_8();
-extern "C" void isr_9();
-extern "C" void isr_10();
-extern "C" void isr_11();
-extern "C" void isr_12();
-extern "C" void isr_13();
-extern "C" void isr_14();
-extern "C" void isr_15();
-extern "C" void isr_16();
-extern "C" void isr_17();
-extern "C" void isr_18();
-extern "C" void isr_19();
-extern "C" void isr_20();
-extern "C" void isr_21();
-extern "C" void isr_22();
-extern "C" void isr_23();
-extern "C" void isr_24();
-extern "C" void isr_25();
-extern "C" void isr_26();
-extern "C" void isr_27();
-extern "C" void isr_28();
-extern "C" void isr_29();
-extern "C" void isr_30();
-extern "C" void isr_31();
+extern "C" void isr_0();  extern "C" void isr_1();  extern "C" void isr_2();
+extern "C" void isr_3();  extern "C" void isr_4();  extern "C" void isr_5();
+extern "C" void isr_6();  extern "C" void isr_7();  extern "C" void isr_8();
+extern "C" void isr_9();  extern "C" void isr_10(); extern "C" void isr_11();
+extern "C" void isr_12(); extern "C" void isr_13(); extern "C" void isr_14();
+extern "C" void isr_15(); extern "C" void isr_16(); extern "C" void isr_17();
+extern "C" void isr_18(); extern "C" void isr_19(); extern "C" void isr_20();
+extern "C" void isr_21(); extern "C" void isr_22(); extern "C" void isr_23();
+extern "C" void isr_24(); extern "C" void isr_25(); extern "C" void isr_26();
+extern "C" void isr_27(); extern "C" void isr_28(); extern "C" void isr_29();
+extern "C" void isr_30(); extern "C" void isr_31();
 
-extern "C" void irq_0();
-extern "C" void irq_1();
-extern "C" void irq_2();
-extern "C" void irq_3();
-extern "C" void irq_4();
-extern "C" void irq_5();
-extern "C" void irq_6();
-extern "C" void irq_7();
-extern "C" void irq_8();
-extern "C" void irq_9();
-extern "C" void irq_10();
-extern "C" void irq_11();
-extern "C" void irq_12();
-extern "C" void irq_13();
-extern "C" void irq_14();
+extern "C" void irq_0();  extern "C" void irq_1();  extern "C" void irq_2();
+extern "C" void irq_3();  extern "C" void irq_4();  extern "C" void irq_5();
+extern "C" void irq_6();  extern "C" void irq_7();  extern "C" void irq_8();
+extern "C" void irq_9();  extern "C" void irq_10(); extern "C" void irq_11();
+extern "C" void irq_12(); extern "C" void irq_13(); extern "C" void irq_14();
 extern "C" void irq_15();
 
 // =====================================================================
 // Configurar una entrada de la IDT
 //
-// No-static: syscall.cpp la llama para registrar int 0x80.
+// flags:
+//   0x8E = present, DPL=0, interrupt gate 32-bit (IF=0 al entrar)
+//   0xEE = present, DPL=3, interrupt gate 32-bit (para int 0x80)
+//   0x8F = present, DPL=0, trap gate 32-bit     (IF=1 al entrar)
 // =====================================================================
 void idt_set_gate(int n, unsigned int base, unsigned short sel, unsigned char flags) {
+    // FIX: validar índice para no corromper memoria adyacente.
+    if (n < 0 || n >= 256) {
+        kprintf("IDT: ERROR indice %d fuera de rango\n", n);
+        return;
+    }
     idt[n].base_lo = base & 0xFFFF;
     idt[n].base_hi = (base >> 16) & 0xFFFF;
     idt[n].sel = sel;
@@ -91,13 +71,13 @@ void idt_init() {
     idt_set_gate(5,  (unsigned int)isr_5,  0x08, 0x8E);
     idt_set_gate(6,  (unsigned int)isr_6,  0x08, 0x8E);
     idt_set_gate(7,  (unsigned int)isr_7,  0x08, 0x8E);
-    idt_set_gate(8,  (unsigned int)isr_8,  0x08, 0x8E);
+    idt_set_gate(8,  (unsigned int)isr_8,  0x08, 0x8E);   // double fault
     idt_set_gate(9,  (unsigned int)isr_9,  0x08, 0x8E);
     idt_set_gate(10, (unsigned int)isr_10, 0x08, 0x8E);
     idt_set_gate(11, (unsigned int)isr_11, 0x08, 0x8E);
     idt_set_gate(12, (unsigned int)isr_12, 0x08, 0x8E);
-    idt_set_gate(13, (unsigned int)isr_13, 0x08, 0x8E);
-    idt_set_gate(14, (unsigned int)isr_14, 0x08, 0x8E);
+    idt_set_gate(13, (unsigned int)isr_13, 0x08, 0x8E);   // GP
+    idt_set_gate(14, (unsigned int)isr_14, 0x08, 0x8E);   // PF
     idt_set_gate(15, (unsigned int)isr_15, 0x08, 0x8E);
     idt_set_gate(16, (unsigned int)isr_16, 0x08, 0x8E);
     idt_set_gate(17, (unsigned int)isr_17, 0x08, 0x8E);
@@ -134,6 +114,15 @@ void idt_init() {
     idt_set_gate(46, (unsigned int)irq_14, 0x08, 0x8E);
     idt_set_gate(47, (unsigned int)irq_15, 0x08, 0x8E);
 
-    // --- Cargar la IDT ---
-    asm volatile("lidt %0" : : "m"(idt_ptr));
+    // FIX: si tienes syscalls por int 0x80, la entrada 0x80 debe
+    // tener DPL=3 para que ring 3 pueda invocarla:
+    //   idt_set_gate(0x80, (unsigned int)isr_128, 0x08, 0xEE);
+    // Descomenta y ajusta cuando implementes syscalls.
+
+        // FIX: "m"(idt_ptr) es lo correcto para lidt con struct empaquetada.
+    // (El intento con "r"(&idt_ptr) daba "operand size mismatch"
+    //  porque el ensamblador no sabe si %0 es la estructura o su puntero.)
+    asm volatile("lidt %0" : : "m"(idt_ptr) : "memory");
+
+    kprintf("IDT: cargada en 0x%x (256 entradas)\n", (unsigned int)&idt);
 }

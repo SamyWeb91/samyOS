@@ -1,0 +1,976 @@
+=== INICIO DE kernel.c ===
+// kernel.c
+#include "screen.h"
+#include "idt.h"
+#include "gdt.h"
+#include "tss.h"
+#include "pic.h"
+#include "pit.h"
+#include "keyboard.h"
+#include "heap.h"
+#include "paging.h"
+#include "ahci.h"
+#include "thread.h"
+#include "syscall.h"
+#include "user.h"
+#include "vbe.h"
+#include "gfx.h"
+#include "win.h"
+#include "pat.h"
+#include "ramdisk.h"
+#include "mouse.h"
+#include "fat32.h"
+#include "wallpaper.h"
+
+void screen_set_gfx_mode(void);
+
+static unsigned char ramdisk_buffer[64 * 1024] __attribute__((aligned(4096)));
+
+extern "C" void kernel_main(void) {
+    // --- init basico ------------------------------------------------
+    idt_init();
+    gdt_init();
+    tss_init();
+    pic_remap();
+    pit_init(100);
+    keyboard_init();
+
+    paging_init();
+    paging_enable_now();
+    pat_init();
+    heap_init();
+
+    {
+        int rd = ramdisk_create_static((unsigned int)ramdisk_buffer,
+                                       (unsigned int)sizeof(ramdisk_buffer));
+        if (rd >= 0)
+            kprintf("Ramdisk: id=%d, %u bytes\n", rd,
+                    (unsigned int)sizeof(ramdisk_buffer));
+        else
+            kprintf("Ramdisk: no se pudo crear\n");
+    }
+
+    // --- VBE + GFX + backbuffer ------------------------------------
+    vbe_init();
+    if (vbe_available()) {
+        gfx_init();
+        gfx_backbuffer_init();
+        gfx_clear(0x00000000);
+        gfx_backbuffer_flip();
+        screen_set_gfx_mode();
+
+        kprintf("MiniOS v10.0\n=================\n\n");
+        kprintf("VBE: %ux%u %ubpp\n",
+                vbe_width(), vbe_height(), vbe_bpp());
+        kprintf("FB:  %x  pitch=%u bytes\n",
+                vbe_fb_addr(), vbe_pitch());
+        kprintf("\n");
+    } else {
+        kprintf("VBE no disponible, sigo en modo texto\n");
+    }
+
+    kprintf("IDT cargada\nGDT recargada\nTSS cargado\n"
+            "PIC remapeado\nPIT a 100 Hz\nTeclado listo\n"
+            "Paging activado\nHeap inicializado\n");
+
+    // --- AHCI ------------------------------------------------------
+    kprintf("Iniciando AHCI...\n");
+    if (ahci_init()) {
+        unsigned int sec = (unsigned int)ahci_get_sector_count();
+        unsigned int mib = (unsigned int)((sec * 512ULL) / (1024ULL * 1024ULL));
+        kprintf("AHCI: %u sectores (%u MiB), puerto %d\n",
+                sec, mib, ahci_get_port_index());
+    } else {
+        kprintf("AHCI: no disponible\n");
+    }
+
+    kprintf("\n");
+    syscall_init();          // registra tambien los SYS_FB_* / SYS_KEY_POLL / ...
+    user_init();
+
+    // --- raton + FAT32 + wallpaper ---------------------------------
+    kprintf("Iniciando Raton...\n");
+    if (mouse_init() == 0) kprintf("Raton: OK\n");
+    else                   kprintf("Raton: fallo al inicializar\n");
+
+    kprintf("Iniciando FAT32...\n");
+    uint32_t lba = fat32_scan();
+    if (lba && fat32_mount(lba)) {
+        kprintf("FAT32: montado en LBA %u\n", lba);
+        kprintf("Cargando fondo de pantalla (/FONDO.BMP)...\n");
+        if (wallpaper_load("/FONDO.BMP"))
+            kprintf("Fondo: cargado con exito\n");
+        else
+            kprintf("Fondo: no se pudo cargar (usando fondo por defecto)\n");
+    } else {
+        kprintf("FAT32: no disponible\n");
+    }
+
+    kprintf("\n");
+    thread_init();
+    win_init();               // subsistema de ventanas (kernel o userspace)
+    kprintf("Threads listos\nVentanas listas\n");
+
+    // --- IRQs y lanzar desktop en ring3 ----------------------------
+    asm volatile("sti");
+
+    if (gfx_backbuffer_active()) gfx_backbuffer_flip();
+
+    kprintf("\nLanzando desktop (ring3)...\n");
+    user_spawn("/DESKTOP.ELF");   // tu loader de ELF actual
+
+    // Si el desktop muere, el kernel no debe caer en bucle con IRQs
+    while (1) {
+        asm volatile("hlt");
+    }
+}
+
+*********************
+=== FIN DE kernel.c ===
+
+=== INICIO DE gfx.cpp ===
+// gfx.cpp
+#include "gfx.h"
+#include "vbe.h"
+#include "screen.h"
+#include "paging.h"
+#include "heap.h"
+#include <stddef.h>
+// Fuente 8x16 exportada por font8x16.c
+extern "C" uint8_t font8x16[256][16];
+
+// =====================================================================
+// Estado del driver
+// =====================================================================
+static uint8_t *fb          = 0;
+static int      fb_w        = 0;
+static int      fb_h        = 0;
+static int      fb_pitch    = 0;
+static int      fb_bpp      = 0;
+static int      fb_bytes_pp = 0;
+
+// Backbuffer
+static uint32_t *bb         = 0;
+static int       bb_w       = 0;
+static int       bb_h       = 0;
+
+// =====================================================================
+// Helpers
+// =====================================================================
+static inline void putpixel_at(uint8_t *p, uint32_t color) {
+    if (fb_bpp == 32) {
+        p[0] = (color      ) & 0xFF;
+        p[1] = (color >>  8) & 0xFF;
+        p[2] = (color >> 16) & 0xFF;
+        p[3] = 0;
+    } else {
+        p[0] = (color      ) & 0xFF;
+        p[1] = (color >>  8) & 0xFF;
+        p[2] = (color >> 16) & 0xFF;
+    }
+}
+
+static inline uint32_t getpixel_at(const uint8_t *p) {
+    uint32_t b = p[0];
+    uint32_t g = p[1];
+    uint32_t r = p[2];
+    return (r << 16) | (g << 8) | b;
+}
+
+static inline uint32_t pack_to_fb(uint32_t c) {
+    return (c & 0x00FFFFFFu);
+}
+
+// =====================================================================
+// Init
+// =====================================================================
+extern "C" void gfx_init(void) {
+    if (!vbe_available()) {
+        kprintf("gfx: VBE no disponible\n");
+        fb = 0;
+        return;
+    }
+
+    uint32_t addr = vbe_fb_addr();
+    fb_w     = vbe_width();
+    fb_h     = vbe_height();
+    fb_pitch = vbe_pitch();
+    fb_bpp   = vbe_bpp();
+
+    if (fb_bpp == 32)      fb_bytes_pp = 4;
+    else if (fb_bpp == 24) fb_bytes_pp = 3;
+    else {
+        kprintf("gfx: bpp=%u no soportado\n", fb_bpp);
+        fb = 0;
+        return;
+    }
+
+    uint32_t total_bytes = (uint32_t)fb_pitch * (uint32_t)fb_h;
+    uint32_t size_kb = (total_bytes + 0xFFF) / 0x400 + 1;
+    paging_map_range(addr, addr, size_kb,
+                     PTE_PRESENT | PTE_RW | PTE_PAT);
+
+    fb = (uint8_t *)addr;
+
+    kprintf("gfx: %dx%d %ubpp pitch=%u bytes fb=%x (mapeado %u KB, WC)\n",
+            fb_w, fb_h, fb_bpp, fb_pitch, addr, size_kb);
+}
+
+extern "C" int gfx_ready(void)      { return fb != 0; }
+extern "C" int gfx_width(void)      { return fb_w; }
+extern "C" int gfx_height(void)     { return fb_h; }
+extern "C" int gfx_bpp(void)        { return fb_bpp; }
+
+// =====================================================================
+// Pixel
+// =====================================================================
+extern "C" void gfx_putpixel(int x, int y, uint32_t color) {
+    if (x < 0 || x >= fb_w || y < 0 || y >= fb_h) return;
+
+    if (bb) {
+        bb[(uint32_t)y * bb_w + x] = color;
+    } else if (fb) {
+        uint8_t *p = fb + (uint32_t)y * fb_pitch
+                        + (uint32_t)x * fb_bytes_pp;
+        putpixel_at(p, color);
+    }
+}
+
+extern "C" uint32_t gfx_getpixel(int x, int y) {
+    if (x < 0 || x >= fb_w || y < 0 || y >= fb_h) return 0;
+
+    if (bb) {
+        return bb[(uint32_t)y * bb_w + x];
+    } else if (fb) {
+        const uint8_t *p = fb + (uint32_t)y * fb_pitch
+                              + (uint32_t)x * fb_bytes_pp;
+        return getpixel_at(p);
+    }
+    return 0;
+}
+
+// =====================================================================
+// Rectangulo relleno
+// =====================================================================
+extern "C" void gfx_fill_rect(int x, int y, int w, int h, uint32_t color) {
+    if (x < 0) { w += x; x = 0; }
+    if (y < 0) { h += y; y = 0; }
+    if (x + w > fb_w) w = fb_w - x;
+    if (y + h > fb_h) h = fb_h - y;
+    if (w <= 0 || h <= 0) return;
+
+    if (bb) {
+        for (int row = 0; row < h; row++) {
+            uint32_t *p = bb + (uint32_t)(y + row) * bb_w + x;
+            for (int col = 0; col < w; col++) p[col] = color;
+        }
+    } else if (fb) {
+        for (int row = 0; row < h; row++) {
+            uint8_t *p = fb + (uint32_t)(y + row) * fb_pitch
+                            + (uint32_t)x * fb_bytes_pp;
+            for (int col = 0; col < w; col++) {
+                putpixel_at(p, color);
+                p += fb_bytes_pp;
+            }
+        }
+    }
+}
+
+extern "C" void gfx_clear(uint32_t color) {
+    if (bb) {
+        for (int y = 0; y < bb_h; y++) {
+            uint32_t *p = bb + (uint32_t)y * bb_w;
+            for (int x = 0; x < bb_w; x++) p[x] = color;
+        }
+        return;
+    }
+    if (!fb) return;
+
+    for (int y = 0; y < fb_h; y++) {
+        uint8_t *p = fb + (uint32_t)y * fb_pitch;
+
+        if (fb_bpp == 32) {
+            uint32_t *p32 = (uint32_t *)p;
+            uint32_t n = (uint32_t)fb_pitch / 4;
+            uint32_t c = pack_to_fb(color);
+            for (uint32_t x = 0; x < n; x++) p32[x] = c;
+        } else if (fb_bpp == 24) {
+            uint32_t n = (uint32_t)fb_pitch / 3;
+            for (uint32_t x = 0; x < n; x++) {
+                p[x*3 + 0] = (color      ) & 0xFF;
+                p[x*3 + 1] = (color >>  8) & 0xFF;
+                p[x*3 + 2] = (color >> 16) & 0xFF;
+            }
+        }
+    }
+}
+
+extern "C" void gfx_draw_rect(int x, int y, int w, int h, uint32_t color) {
+    gfx_fill_rect(x, y,         w, 1, color);
+    gfx_fill_rect(x, y + h - 1, w, 1, color);
+    gfx_fill_rect(x,         y, 1, h, color);
+    gfx_fill_rect(x + w - 1, y, 1, h, color);
+}
+
+extern "C" void gfx_copy_rect(int src_x, int src_y,
+                              int dst_x, int dst_y,
+                              int w, int h) {
+    if (w <= 0 || h <= 0) return;
+    if (src_x < 0 || src_y < 0 || dst_x < 0 || dst_y < 0) return;
+    if (src_x + w > fb_w || dst_x + w > fb_w) return;
+    if (src_y + h > fb_h || dst_y + h > fb_h) return;
+
+    if (bb) {
+        if (dst_y < src_y) {
+            for (int row = 0; row < h; row++) {
+                uint32_t *s = bb + (uint32_t)(src_y + row) * bb_w + src_x;
+                uint32_t *d = bb + (uint32_t)(dst_y + row) * bb_w + dst_x;
+                for (int i = 0; i < w; i++) d[i] = s[i];
+            }
+        } else {
+            for (int row = h - 1; row >= 0; row--) {
+                uint32_t *s = bb + (uint32_t)(src_y + row) * bb_w + src_x;
+                uint32_t *d = bb + (uint32_t)(dst_y + row) * bb_w + dst_x;
+                for (int i = 0; i < w; i++) d[i] = s[i];
+            }
+        }
+    } else if (fb) {
+        int bytes = w * fb_bytes_pp;
+        if (dst_y < src_y) {
+            for (int row = 0; row < h; row++) {
+                uint8_t *s = fb + (uint32_t)(src_y + row) * fb_pitch
+                                + (uint32_t)src_x * fb_bytes_pp;
+                uint8_t *d = fb + (uint32_t)(dst_y + row) * fb_pitch
+                                + (uint32_t)dst_x * fb_bytes_pp;
+                for (int i = 0; i < bytes; i++) d[i] = s[i];
+            }
+        } else {
+            for (int row = h - 1; row >= 0; row--) {
+                uint8_t *s = fb + (uint32_t)(src_y + row) * fb_pitch
+                                + (uint32_t)src_x * fb_bytes_pp;
+                uint8_t *d = fb + (uint32_t)(dst_y + row) * fb_pitch
+                                + (uint32_t)dst_x * fb_bytes_pp;
+                for (int i = 0; i < bytes; i++) d[i] = s[i];
+            }
+        }
+    }
+}
+
+// =====================================================================
+// Blit RGB888 (usado por el cargador de BMP, sin depender de FAT32)
+// =====================================================================
+extern "C" void gfx_blit_rgb888(int dst_x, int dst_y, int w, int h,
+                                const uint8_t *src, int src_stride) {
+    if (!src) return;
+
+    int sx = 0, sy = 0;
+    if (dst_x < 0) { sx = -dst_x; w += dst_x; dst_x = 0; }
+    if (dst_y < 0) { sy = -dst_y; h += dst_y; dst_y = 0; }
+    if (dst_x + w > fb_w) w = fb_w - dst_x;
+    if (dst_y + h > fb_h) h = fb_h - dst_y;
+    if (w <= 0 || h <= 0) return;
+
+    for (int row = 0; row < h; row++) {
+        const uint8_t *srow = src + (size_t)(sy + row) * src_stride
+                                  + (size_t)sx * 3;
+        uint32_t *drow = 0;
+        uint8_t  *frow = 0;
+
+        if (bb) {
+            drow = bb + (uint32_t)(dst_y + row) * bb_w + dst_x;
+        } else if (fb) {
+            frow = fb + (uint32_t)(dst_y + row) * fb_pitch
+                       + (uint32_t)dst_x * fb_bytes_pp;
+        }
+
+        for (int x = 0; x < w; x++) {
+            uint8_t b = srow[x*3 + 0];
+            uint8_t g = srow[x*3 + 1];
+            uint8_t r = srow[x*3 + 2];
+            uint32_t c = ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
+
+            if (drow)      drow[x] = c;
+            else if (frow) putpixel_at(frow + x * fb_bytes_pp, c);
+        }
+    }
+}
+
+// =====================================================================
+// Texto
+// =====================================================================
+extern "C" void gfx_draw_char(int x, int y, char c, uint32_t fg, uint32_t bg) {
+    if (x < 0 || y < 0) return;
+    if (x + 8 > fb_w) return;
+    if (y + 16 > fb_h) return;
+
+    unsigned char uc = (unsigned char)c;
+    const uint8_t *glyph = font8x16[uc];
+
+    for (int row = 0; row < 16; row++) {
+        uint8_t bits = glyph[row];
+        for (int col = 0; col < 8; col++) {
+            uint32_t color = (bits & (0x80 >> col)) ? fg : bg;
+            gfx_putpixel(x + col, y + row, color);
+        }
+    }
+}
+
+extern "C" void gfx_draw_string(int x, int y, const char *s,
+                                uint32_t fg, uint32_t bg) {
+    int cx = x, cy = y;
+    while (*s) {
+        if (*s == '\n') {
+            cx = x;
+            cy += 16;
+        } else {
+            gfx_draw_char(cx, cy, *s, fg, bg);
+            cx += 8;
+            if (cx + 8 > fb_w) { cx = x; cy += 16; }
+        }
+        s++;
+    }
+}
+
+// =====================================================================
+// Doble buffer
+// =====================================================================
+extern "C" int gfx_backbuffer_init(void) {
+    if (!fb) return 0;
+    if (bb) return 1;
+
+    unsigned int bytes = (unsigned int)fb_w * fb_h * sizeof(uint32_t);
+
+    if (bytes > 16u * 1024u * 1024u) {
+        kprintf("gfx: backbuffer demasiado grande (%u bytes)\n", bytes);
+        return 0;
+    }
+
+    bb = (uint32_t *)kmalloc(bytes);
+    if (!bb) {
+        kprintf("gfx: kmalloc devolvio 0 para backbuffer (%u bytes)\n", bytes);
+        return 0;
+    }
+
+    unsigned int addr = (unsigned int)bb;
+    if (addr < 0x100000u || addr > 0x8000000u) {
+        kprintf("gfx: backbuffer en direccion sospechosa %x\n", addr);
+        bb = 0;
+        return 0;
+    }
+
+    volatile uint32_t *test = bb;
+    test[0] = 0;
+    test[bytes / 4 - 1] = 0;
+
+    bb_w = fb_w;
+    bb_h = fb_h;
+
+    kprintf("gfx: backbuffer %dx%d (%u bytes, %u KB) en %x\n",
+            bb_w, bb_h, bytes, bytes / 1024, addr);
+    return 1;
+}
+
+extern "C" int gfx_backbuffer_active(void) { return bb != 0; }
+
+extern "C" uint32_t *gfx_backbuffer_va(void)   { return bb; }
+extern "C" int       gfx_backbuffer_width(void){ return bb_w; }
+extern "C" int       gfx_backbuffer_height(void){ return bb_h; }
+
+extern "C" void gfx_backbuffer_flip(void) {
+    if (!fb || !bb) return;
+
+    for (int y = 0; y < fb_h; y++) {
+        uint32_t *src = bb + (uint32_t)y * bb_w;
+        uint8_t  *dst = fb + (uint32_t)y * fb_pitch;
+
+        if (fb_bpp == 32) {
+            uint32_t *d32 = (uint32_t *)dst;
+            for (int x = 0; x < fb_w; x++) d32[x] = src[x];
+            uint32_t n = (uint32_t)fb_pitch / 4;
+            for (uint32_t x = (uint32_t)fb_w; x < n; x++) d32[x] = 0;
+        } else if (fb_bpp == 24) {
+            for (int x = 0; x < fb_w; x++) {
+                uint32_t c = src[x];
+                dst[x*3 + 0] = (c      ) & 0xFF;
+                dst[x*3 + 1] = (c >>  8) & 0xFF;
+                dst[x*3 + 2] = (c >> 16) & 0xFF;
+            }
+            uint32_t n = (uint32_t)fb_pitch / 3;
+            for (uint32_t x = (uint32_t)fb_w; x < n; x++) {
+                dst[x*3 + 0] = 0;
+                dst[x*3 + 1] = 0;
+                dst[x*3 + 2] = 0;
+            }
+        }
+    }
+}
+
+extern "C" void gfx_backbuffer_flip_region(int rx, int ry, int rw, int rh) {
+    if (!fb || !bb) return;
+
+    int W = fb_w, H = fb_h;
+    if (rx < 0) { rw += rx; rx = 0; }
+    if (ry < 0) { rh += ry; ry = 0; }
+    if (rx + rw > W) rw = W - rx;
+    if (ry + rh > H) rh = H - ry;
+    if (rw <= 0 || rh <= 0) return;
+
+    if (fb_bpp == 32) {
+        for (int y = ry; y < ry + rh; y++) {
+            uint32_t *src = bb + (uint32_t)y * bb_w + rx;
+            uint32_t *dst = (uint32_t *)(fb + (uint32_t)y * fb_pitch) + rx;
+            for (int x = 0; x < rw; x++) dst[x] = src[x];
+        }
+    } else if (fb_bpp == 24) {
+        for (int y = ry; y < ry + rh; y++) {
+            uint32_t *src = bb + (uint32_t)y * bb_w + rx;
+            uint8_t  *dst = fb + (uint32_t)y * fb_pitch + (uint32_t)rx * 3;
+            for (int x = 0; x < rw; x++) {
+                uint32_t c = src[x];
+                dst[x*3 + 0] = (c      ) & 0xFF;
+                dst[x*3 + 1] = (c >>  8) & 0xFF;
+                dst[x*3 + 2] = (c >> 16) & 0xFF;
+            }
+        }
+    }
+}
+
+extern "C" void gfx_backbuffer_free(void) {
+    if (bb) {
+        kfree(bb);
+        bb = 0; bb_w = 0; bb_h = 0;
+    }
+}
+
+*********************
+=== FIN DE gfx.cpp ===
+
+=== INICIO DE paging.cpp ===
+// paging.cpp
+#include "paging.h"
+#include "screen.h"
+#include "heap.h"          // kmalloc para paging_map_shared_in_current
+
+// =====================================================================
+// Estado interno
+// =====================================================================
+// El directorio se expone como variable global (no static) para que
+// otros modulos del kernel (p.ej. debug) puedan consultarlo. El simbolo
+// tiene nombre estable y esta alineado a 4 KiB.
+unsigned int page_directory[1024] __attribute__((aligned(4096)));
+static unsigned int page_table_0[1024] __attribute__((aligned(4096)));
+
+// Pool de PTs preasignadas para el kernel (identity map 0..128 MB).
+// Solo lo usa paging_map cuando la PDE esta vacia y el llamante es
+// paging_map_range de kernel. Las PTs del espacio de usuario se piden
+// a kmalloc (ver paging_map_shared_in_current), asi no agotamos el pool
+// del kernel.
+#define PT_POOL_SIZE 32
+static unsigned int pt_pool[PT_POOL_SIZE][1024] __attribute__((aligned(4096)));
+static int pt_pool_next = 0;
+
+extern "C" void paging_enable_asm(unsigned int pd_phys);
+
+// =====================================================================
+// INIT
+// =====================================================================
+extern "C" void paging_init(void) {
+    for (int i = 0; i < 1024; i++) {
+        page_directory[i] = 0;
+        page_table_0[i]   = 0;
+    }
+    pt_pool_next = 0;
+
+    // Mapear los primeros 128 MB de RAM linealmente (identidad).
+    // 128 MB = 32 page tables de 4 MB cada una.
+    // Cubre kernel + heap + backbuffer.
+    //
+    // IMPORTANTE: se mapea con PTE_PRESENT | PTE_RW, sin PTE_USER.
+    // El user code NO puede acceder a esta zona directamente.
+    // El acceso controlado de ring3 al backbuffer se hace en
+    // paging_map_shared_in_current(), que crea PTEs con PTE_USER
+    // apuntando a la misma PA, en un rango de VA de usuario distinto.
+    int PTs_needed = 32;
+    if (PTs_needed > PT_POOL_SIZE) PTs_needed = PT_POOL_SIZE;
+
+    for (int pt_i = 0; pt_i < PTs_needed; pt_i++) {
+        unsigned int *pt;
+        if (pt_i == 0) {
+            pt = page_table_0;
+        } else {
+            pt = pt_pool[pt_i];
+        }
+
+        unsigned int base_phys = (unsigned int)pt_i * 0x400000u;
+
+        for (int i = 0; i < 1024; i++) {
+            pt[i] = (base_phys + (unsigned int)i * 0x1000u)
+                    | PTE_PRESENT | PTE_RW;
+        }
+
+        page_directory[pt_i] = ((unsigned int)pt) | PTE_PRESENT | PTE_RW;
+    }
+
+    kprintf("paging: %d MB mapeados (0x0 - 0x%x)\n",
+            PTs_needed * 4, PTs_needed * 0x400000u);
+}
+
+extern "C" void paging_enable_now(void) {
+    paging_enable_asm((unsigned int)page_directory);
+}
+
+// =====================================================================
+// Helpers internos
+// =====================================================================
+
+// Busca una PTE libre consecutiva de `pages` paginas en la zona de
+// usuario (PDEs 0..767). Devuelve la VA base, o 0 si no encuentra.
+// No crea PTs nuevas; para eso ver paging_map_shared_in_current.
+static unsigned int find_free_user_va(unsigned int pages) {
+    if (pages == 0 || pages > 1024) return 0;
+
+    for (unsigned int pde = 0; pde < 768; pde++) {
+        if (!(page_directory[pde] & PTE_PRESENT)) continue;
+
+        unsigned int *pt = (unsigned int *)(page_directory[pde] & 0xFFFFF000u);
+
+        unsigned int run = 0;
+        for (unsigned int i = 0; i < 1024; i++) {
+            if (!(pt[i] & PTE_PRESENT)) {
+                run++;
+                if (run == pages) {
+                    return (pde << 22) | ((i - run + 1) << 12);
+                }
+            } else {
+                run = 0;
+            }
+        }
+    }
+    return 0;
+}
+
+// Devuelve la PT de un PDE, creandola si no existe. La PT nueva se
+// toma del pool del kernel o de kmalloc. Si `pde_is_user` es true,
+// marca el PDE con PTE_USER y PTE_RW.
+static unsigned int *ensure_page_table(unsigned int pde_index,
+                                       int pde_is_user) {
+    unsigned int e = page_directory[pde_index];
+    if (e & PTE_PRESENT) {
+        if (pde_is_user && !(e & PTE_USER)) {
+            page_directory[pde_index] = e | PTE_USER | PTE_RW;
+            asm volatile("invlpg (%0)" :: "r"(pde_index << 22) : "memory");
+        }
+        return (unsigned int *)(e & 0xFFFFF000u);
+    }
+
+    // Crear PT nueva
+    unsigned int *new_pt = 0;
+
+    if (!pde_is_user) {
+        // Kernel: del pool preasignado.
+        if (pt_pool_next >= PT_POOL_SIZE) return 0;
+        new_pt = pt_pool[pt_pool_next++];
+    } else {
+        // Usuario: de kmalloc, para no agotar el pool del kernel.
+        // El heap del kernel esta en identidad 0..128 MB, asi que la
+        // PA == VA y el kernel puede escribirla directamente.
+        void *p = kmalloc(4096);
+        if (!p) return 0;
+        new_pt = (unsigned int *)p;
+    }
+
+    for (int i = 0; i < 1024; i++) new_pt[i] = 0;
+
+    unsigned int pde_flags = PTE_PRESENT | PTE_RW;
+    if (pde_is_user) pde_flags |= PTE_USER;
+
+    page_directory[pde_index] = ((unsigned int)new_pt) | pde_flags;
+    return new_pt;
+}
+
+// =====================================================================
+// paging_map  (comportamiento original, solo arreglos minimos)
+// =====================================================================
+extern "C" void paging_map(unsigned int virt, unsigned int phys,
+                           unsigned int flags) {
+    unsigned int pde_index = virt >> 22;
+    unsigned int pt_index  = (virt >> 12) & 0x3FF;
+
+    // Una PDE con PTE_USER solo se necesita si el llamante lo pide.
+    int is_user = (flags & PTE_USER) ? 1 : 0;
+    unsigned int *pt = ensure_page_table(pde_index, is_user);
+    if (!pt) return;
+
+    // Preservar cualquier otro bit de flags que el llamante haya puesto
+    // (PTE_RW, PTE_USER, PTE_PWT, PTE_PCD, PTE_PAT, ...) y forzar PRESENT.
+    pt[pt_index] = (phys & 0xFFFFF000u)
+                 | (flags & 0xFFFu)
+                 | PTE_PRESENT;
+
+    asm volatile("invlpg (%0)" :: "r"(virt) : "memory");
+}
+
+// =====================================================================
+// paging_map_range  (comportamiento original: 1 unidad = 4 KB)
+// =====================================================================
+extern "C" void paging_map_range(unsigned int virt, unsigned int phys,
+                                 unsigned int size_kb, unsigned int flags) {
+    // NOTA: por compatibilidad historica, "size_kb" es en realidad
+    // numero de paginas (cada iteracion avanza 0x1000). Ver paging.h.
+    for (unsigned int i = 0; i < size_kb; i++) {
+        paging_map(virt + i * 0x1000u, phys + i * 0x1000u, flags);
+    }
+}
+
+// =====================================================================
+// paging_map_pages  (nueva API, inequivoca: pages * 4 KB)
+// =====================================================================
+extern "C" void paging_map_pages(unsigned int virt, unsigned int phys,
+                                 unsigned int pages, unsigned int flags) {
+    for (unsigned int i = 0; i < pages; i++) {
+        paging_map(virt + i * 0x1000u, phys + i * 0x1000u, flags);
+    }
+}
+
+// =====================================================================
+// paging_unmap
+// =====================================================================
+extern "C" void paging_unmap(unsigned int virt) {
+    unsigned int pde_index = virt >> 22;
+    unsigned int pt_index  = (virt >> 12) & 0x3FF;
+
+    if (!(page_directory[pde_index] & PTE_PRESENT)) return;
+
+    unsigned int *pt = (unsigned int *)(page_directory[pde_index] & 0xFFFFF000u);
+    pt[pt_index] = 0;
+
+    asm volatile("invlpg (%0)" :: "r"(virt) : "memory");
+}
+
+// =====================================================================
+// paging_map_shared_in_current
+//
+// Objetivo: dado un rango fisico `phys..phys+len` (que el kernel puede
+// tocar via identidad 0..128 MB), devolver un VA accesible desde ring3
+// que apunte a esa misma memoria fisica.
+//
+// Estrategia:
+//   1) Si `phys` YA esta mapeada con PTE_USER en alguna PDE de usuario,
+//      devolver esa VA (idempotencia).
+//   2) En otro caso, buscar `pages` PTEs libres consecutivas en la zona
+//      de usuario, crear la PT si hace falta, rellenar PTEs con
+//      PTE_PRESENT|PTE_USER|pte_flags|PTE_RW, e invlpg.
+//
+// Zona de usuario: PDEs 0..767 (VA 0x00000000 .. 0xBFFFFFFF).
+// Zona de kernel:  PDEs 768..1023, jamas se tocan aqui.
+// =====================================================================
+extern "C" unsigned int paging_map_shared_in_current(unsigned int phys,
+                                                     unsigned int len,
+                                                     unsigned int pte_flags) {
+    if (len == 0) return 0;
+
+    pte_flags |= PTE_PRESENT | PTE_USER | PTE_RW;
+
+    unsigned int page_phys = phys & 0xFFFFF000u;
+    unsigned int offset_in = phys & 0xFFFu;
+    unsigned int page_len  = ((offset_in + len) + 0xFFFu) & 0xFFFFF000u;
+    unsigned int pages     = page_len >> 12;
+
+    // --- Paso 1: idempotencia ---
+    // Buscar si page_phys ya esta mapeada con PTE_USER en una PDE de
+    // usuario. Si es asi, devolver la VA correspondiente.
+    for (unsigned int pde = 0; pde < 768; pde++) {
+        if (!(page_directory[pde] & PTE_PRESENT)) continue;
+        if (!(page_directory[pde] & PTE_USER))   continue;
+
+        unsigned int *pt = (unsigned int *)(page_directory[pde] & 0xFFFFF000u);
+        for (unsigned int i = 0; i < 1024; i++) {
+            unsigned int e = pt[i];
+            if (!(e & PTE_PRESENT)) continue;
+            if (!(e & PTE_USER))    continue;
+            if ((e & 0xFFFFF000u) == page_phys) {
+                return (pde << 22) | (i << 12) | offset_in;
+            }
+        }
+    }
+
+    // --- Paso 2: buscar VA libre ---
+    unsigned int va_base = find_free_user_va(pages);
+
+    // Si no hay hueco contiguo en PTs existentes, crear una PT nueva
+    // entera (1024 PTEs libres) en alguna PDE vacia de usuario.
+    if (!va_base) {
+        for (unsigned int pde = 0; pde < 768; pde++) {
+            if (page_directory[pde] & PTE_PRESENT) continue;
+
+            unsigned int *pt = ensure_page_table(pde, /*is_user=*/1);
+            if (!pt) continue;
+
+            va_base = pde << 22;
+            break;
+        }
+    }
+
+    if (!va_base) return 0;
+
+    // --- Paso 3: rellenar PTEs ---
+    for (unsigned int i = 0; i < pages; i++) {
+        unsigned int va   = va_base + (i << 12);
+        unsigned int p_pa = page_phys + (i << 12);
+        unsigned int pde  = va >> 22;
+        unsigned int pte  = (va >> 12) & 0x3FF;
+
+        // Asegurar que la PDE existe (find_free_user_va ya garantiza
+        // que existe para PTs encontradas; el camino de "PT nueva"
+        // tambien la crea).
+        unsigned int *pt = ensure_page_table(pde, /*is_user=*/1);
+        if (!pt) return 0;
+
+        pt[pte] = (p_pa & 0xFFFFF000u) | (pte_flags & 0xFFFu) | PTE_PRESENT;
+
+        asm volatile("invlpg (%0)" :: "r"(va) : "memory");
+    }
+
+    return va_base + offset_in;
+}
+
+// =====================================================================
+// Info interna
+// =====================================================================
+extern "C" unsigned int  paging_get_pd_addr(void)  { return (unsigned int)page_directory; }
+extern "C" unsigned int  paging_get_pt0_addr(void) { return (unsigned int)page_table_0; }
+extern "C" unsigned int *paging_get_directory(void){ return page_directory; }
+
+*********************
+=== FIN DE paging.cpp ===
+
+=== INICIO DE wallpaper.cpp ===
+// wallpaper.cpp
+#include "wallpaper.h"
+#include "gfx.h"
+#include "fat32.h"
+#include "heap.h"
+#include "screen.h"   // kprintf
+#include <stddef.h>
+// Lectura segura de enteros little-endian (evita UB por aliasing/padding)
+static inline uint32_t rd_u32(const uint8_t *p) {
+    return (uint32_t)p[0]
+         | ((uint32_t)p[1] <<  8)
+         | ((uint32_t)p[2] << 16)
+         | ((uint32_t)p[3] << 24);
+}
+static inline uint16_t rd_u16(const uint8_t *p) {
+    return (uint16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8));
+}
+
+extern "C" int wallpaper_load(const char *path) {
+    if (!path) return 0;
+
+    int fsize = fat32_file_size(path);
+    if (fsize <= 0) return 0;
+
+    uint8_t *buf = (uint8_t *)kmalloc((unsigned int)fsize);
+    if (!buf) return 0;
+
+    int nread = fat32_read_file(path, buf, fsize);
+    if (nread != fsize) {
+        kfree(buf);
+        return 0;
+    }
+
+    if (fsize < 54) { kfree(buf); return 0; }        // cabecera BMP minima
+
+    uint32_t off    = rd_u32(buf + 10);
+    uint32_t w      = rd_u32(buf + 18);
+    uint32_t h      = rd_u32(buf + 22);
+    uint16_t bpp    = rd_u16(buf + 28);
+
+    if (bpp != 24 || w == 0 || h == 0) {
+        kfree(buf);
+        return 0;
+    }
+
+    // BMP es bottom-up. Bliteamos una fila a la vez con gfx_blit_rgb888,
+    // que no depende de FAT32 ni toca el backbuffer directamente.
+    int stride = (int)((w * 3u + 3u) & ~3u);
+    uint32_t draw_h = h;
+    if (draw_h > (uint32_t)gfx_height()) draw_h = (uint32_t)gfx_height();
+    uint32_t draw_w = w;
+    if (draw_w > (uint32_t)gfx_width())  draw_w = (uint32_t)gfx_width();
+
+    for (uint32_t y = 0; y < draw_h; y++) {
+        const uint8_t *row = buf + off + (size_t)(h - 1 - y) * (size_t)stride;
+        gfx_blit_rgb888(0, (int)y, (int)draw_w, 1, row, stride);
+    }
+
+    kfree(buf);
+    return 1;
+}
+
+*********************
+=== FIN DE wallpaper.cpp ===
+
+=== INICIO DE vbe.cpp ===
+#include "vbe.h"
+#include "screen.h"
+
+// Info guardada por el bootloader en 0x6000:
+//   0x6000: magic "VBE1" o 0
+//   0x6004: framebuffer physical addr (u32)
+//   0x6008: pitch (u16)
+//   0x600A: width (u16)
+//   0x600C: height (u16)
+//   0x600E: bpp (u8)
+
+struct VBEInfo {
+    uint32_t magic;
+    uint32_t fb_addr;
+    uint16_t pitch;
+    uint16_t width;
+    uint16_t height;
+    uint8_t  bpp;
+} __attribute__((packed));
+
+static VBEInfo vbe;
+
+extern "C" void vbe_init(void) {
+    volatile uint32_t *p = (volatile uint32_t *)0x6000;
+
+    vbe.magic  = p[0];
+    vbe.fb_addr = p[1];
+    vbe.pitch  = *(volatile uint16_t *)(0x6008);
+    vbe.width  = *(volatile uint16_t *)(0x600A);
+    vbe.height = *(volatile uint16_t *)(0x600C);
+    vbe.bpp    = *(volatile uint8_t  *)(0x600E);
+}
+
+extern "C" int vbe_available(void) {
+    return vbe.magic == 0x31454256;   // "VBE1"
+}
+
+extern "C" uint32_t vbe_fb_addr(void) { return vbe.fb_addr; }
+extern "C" uint16_t vbe_pitch(void)   { return vbe.pitch; }
+extern "C" uint16_t vbe_width(void)   { return vbe.width; }
+extern "C" uint16_t vbe_height(void)  { return vbe.height; }
+extern "C" uint8_t  vbe_bpp(void)     { return vbe.bpp; }
+
+*********************
+=== FIN DE vbe.cpp ===
+
+=== INICIO DE isr.h ===
+#pragma once
+
+struct Regs {
+    // pusha
+    unsigned int edi, esi, ebp, esp_dummy, ebx, edx, ecx, eax;
+    // stub
+    unsigned int int_no, err_code;
+    // CPU
+    unsigned int eip, cs, eflags, useresp, ss;
+};
+
+extern "C" void isr_handler(Regs *r);
+
+*********************
+=== FIN DE isr.h ===
+

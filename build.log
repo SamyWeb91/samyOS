@@ -1,0 +1,7 @@
+=== BUILD Tue Oct 13 12:33:06 PM CDT 2026 ===
+win.o: 0
+shell.o: 0
+ld: 0
+>>> Tamaños
+-rwxrwxr-x 1 root root 65K Oct 13 12:33 kernel-safe.bin
+>>> Símbolos más grandes

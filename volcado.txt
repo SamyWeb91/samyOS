@@ -1,0 +1,441 @@
+===== tss.cpp =====
+
+#include "tss.h"
+#include "gdt.h"
+#include "screen.h"
+
+static TSS tss;
+
+extern "C" void tss_flush(void);   // en tss.asm
+
+// =====================================================================
+// Init
+// =====================================================================
+extern "C" void tss_init(void) {
+    // Limpiar la estructura
+    uint8_t *p = (uint8_t*)&tss;
+    for (unsigned int i = 0; i < sizeof(TSS); i++) p[i] = 0;
+
+    // ss0 = 0x10 (segmento de datos del kernel)
+    tss.ss0 = 0x10;
+
+    // esp0 = 0 por ahora. Se configura en cada cambio de proceso (futuro ring 3).
+    tss.esp0 = 0;
+
+    // iomap_base = sizeof(TSS) → sin bitmap de I/O
+    // (si fuera menor, la CPU leería basura y daría #GP al hacer I/O)
+    tss.iomap_base = sizeof(TSS);
+
+    // Registrar el descriptor en la GDT.
+    // Índice 5 → selector 0x28.
+    gdt_set_tss(5, (uint32_t)&tss, sizeof(TSS) - 1);
+
+    // Cargar el TSS en el registro TR
+    tss_flush();
+
+    kprintf("TSS: cargado en 0x28 (base=%x, limit=%u, ss0=0x%x)\n",
+            (uint32_t)&tss, sizeof(TSS) - 1, tss.ss0);
+}
+
+// =====================================================================
+// Set kernel stack (para ring 3)
+// =====================================================================
+extern "C" void tss_set_kernel_stack(uint32_t esp0) {
+    tss.esp0 = esp0;
+}
+
+// =====================================================================
+// Getters (para shell)
+// =====================================================================
+extern "C" uint32_t tss_get_esp0(void)  { return tss.esp0; }
+extern "C" uint32_t tss_get_ss0(void)   { return tss.ss0; }
+extern "C" uint32_t tss_get_base(void)  { return (uint32_t)&tss; }
+extern "C" uint32_t tss_get_limit(void) { return sizeof(TSS) - 1; }
+
+********
+
+===== tss.asm =====
+
+format ELF
+use32
+
+public tss_flush
+
+section '.text' executable
+
+; Carga el TSS en el registro TR.
+; El selector 0x28 = índice 5 * 8 + RPL 0.
+tss_flush:
+    mov ax, 0x28
+    ltr ax
+    ret
+
+********
+
+===== ring3_test.cpp =====
+
+#include "screen.h"
+#include "paging.h"
+#include "tss.h"
+
+#include "ring3_test_blob.c"
+
+// Usamos 0x08000000 (128 MB), fuera del rango del kernel
+#define USER_CODE  0x08000000
+#define USER_STACK 0x08010000
+
+extern "C" void enter_user_mode(uint32_t entry, uint32_t user_stack);
+extern "C" void paging_map(unsigned int virt, unsigned int phys, unsigned int flags);
+extern "C" void paging_flush_tlb(void);
+
+// Pila del kernel dedicada para TSS.esp0 (fuera del BSS)
+static uint8_t ring3_kernel_stack[8192] __attribute__((aligned(16)));
+
+extern "C" void ring3_test_run(void) {
+    kprintf("ring3: === DIAGNOSTICO ===\n");
+
+    // 1. Mapear la pagina de codigo
+    paging_map(USER_CODE, 0x500000, PTE_PRESENT | PTE_RW | PTE_USER);
+    // 2. Mapear la pila de usuario
+    paging_map(USER_STACK, 0x502000, PTE_PRESENT | PTE_RW | PTE_USER);
+    paging_map(USER_STACK + 0x1000, 0x503000, PTE_PRESENT | PTE_RW | PTE_USER);
+
+    // 3. Copiar el binario (3 bytes: cli; hlt)
+    unsigned int safe_len = ring3_test_bin_len;
+    if (safe_len == 0 || safe_len > 4096) {
+        kprintf("ring3: ERROR tamano binario invalido (%u)\n", safe_len);
+        return;
+    }
+    kprintf("ring3: copiando %u bytes a 0x500000...\n", safe_len);
+
+    uint8_t *dst = (uint8_t *)0x500000;
+    const uint8_t *src = ring3_test_bin;
+    for (unsigned int i = 0; i < safe_len; i++) dst[i] = src[i];
+
+    paging_flush_tlb();
+
+    // 4. TSS.esp0 = 0x90000 (pila del bootloader, ya mapeada)
+    kprintf("ring3: TSS.esp0 = 0x90000\n");
+    tss_set_kernel_stack(0x90000);
+
+    // 5. Saltar a ring 3 con EFLAGS = 0x202 (IOPL=0)
+    kprintf("ring3: saltando a 0x%x (ESP=0x%x)...\n", USER_CODE, USER_STACK + 0x2000);
+    enter_user_mode(USER_CODE, USER_STACK + 0x2000);
+
+    // Si volvemos aquí, el iretd funcionó pero el binario terminó
+    kprintf("ring3: volvimos de ring 3 (el binario termino)\n");
+}
+
+********
+
+===== usermode.asm =====
+
+format ELF
+use32
+
+public enter_user_mode
+extrn tss_set_kernel_stack
+
+section '.text' executable
+
+; void enter_user_mode(uint32_t entry, uint32_t user_stack);
+;   [esp+4] = entry
+;   [esp+8] = user_stack
+enter_user_mode:
+    ; 1. Guardar argumentos en registros seguros
+    mov eax, [esp + 4]      ; EAX = EIP del usuario
+    mov edx, [esp + 8]      ; EDX = ESP del usuario
+
+    ; 2. Configurar TSS.esp0 = 0x90000 (pila del bootloader, ya mapeada)
+    push 0x90000
+    call tss_set_kernel_stack
+    add esp, 4
+
+    ; 3. Deshabilitar interrupciones mientras cambiamos de contexto
+    cli
+
+    ; 4. Cargar segmentos de datos de usuario (0x23)
+    mov cx, 0x23
+    mov ds, cx
+    mov es, cx
+    mov fs, cx
+    mov gs, cx
+
+    ; 5. Construir el frame para el iretd
+    ; Orden: SS, ESP, EFLAGS, CS, EIP
+    push 0x23               ; SS  = user data | RPL 3
+    push edx                ; ESP = pila del usuario
+    push 0x202              ; EFLAGS = IF=1 (interrupciones activadas)
+    push 0x1B               ; CS  = user code | RPL 3
+    push eax                ; EIP = punto de entrada del usuario
+
+    ; 6. Flush de TLB (recargar CR3)
+    mov eax, cr3
+    mov cr3, eax
+
+    ; 7. ¡Salto a ring 3!
+    iretd
+
+********
+
+===== gdt.cpp =====
+
+#include "gdt.h"
+#include "screen.h"
+
+// 6 entradas de 8 bytes = 48 bytes
+// El descriptor TSS ocupa 2 entradas (16 bytes), así que
+// necesitamos 5 entradas "normales" + 1 TSS = 6 entradas.
+// Pero el TSS ocupa 2 → reservamos 7 para estar seguros.
+#define GDT_ENTRIES  7
+
+static uint64_t gdt[GDT_ENTRIES];
+
+struct GDTDescriptor {
+    uint16_t limit;
+    uint32_t base;
+} __attribute__((packed));
+
+static GDTDescriptor gdtr;
+
+extern "C" void gdt_flush(uint32_t gdtr_addr);
+
+// =====================================================================
+// Helper: construir un descriptor de 8 bytes
+// =====================================================================
+static void gdt_set_entry(int i,
+                          uint32_t base,
+                          uint32_t limit,
+                          uint8_t  access,
+                          uint8_t  flags)
+{
+    gdt[i] =
+        ((uint64_t)(limit & 0xFFFF)) |
+        ((uint64_t)(base & 0xFFFFFF) << 16) |
+        ((uint64_t)access << 40) |
+        ((uint64_t)((limit >> 16) & 0x0F) << 48) |
+        ((uint64_t)(flags & 0xF0) << 48) |
+        ((uint64_t)((base >> 24) & 0xFF) << 56);
+}
+
+// =====================================================================
+// Init
+// =====================================================================
+extern "C" void gdt_init(void) {
+    // 0: null
+    gdt[0] = 0;
+
+    // 1: kernel code (ring 0)
+    //    access = 0x9A = present, DPL=0, code, exec/read
+    //    flags  = 0xCF = gran=4K, 32-bit, limit[19:16]=0xF
+    gdt_set_entry(1, 0, 0xFFFFF, 0x9A, 0xCF);
+
+    // 2: kernel data (ring 0)
+    //    access = 0x92 = present, DPL=0, data, read/write
+    gdt_set_entry(2, 0, 0xFFFFF, 0x92, 0xCF);
+
+    // 3: user code (ring 3)
+    //    access = 0xFA = present, DPL=3, code, exec/read
+    gdt_set_entry(3, 0, 0xFFFFF, 0xFA, 0xCF);
+
+    // 4: user data (ring 3)
+    //    access = 0xF2 = present, DPL=3, data, read/write
+    gdt_set_entry(4, 0, 0xFFFFF, 0xF2, 0xCF);
+
+    // 5-6: reservados para el TSS (se llenan en tss_init)
+    gdt[5] = 0;
+    gdt[6] = 0;
+
+    // Cargar la GDT
+    gdtr.limit = sizeof(gdt) - 1;
+    gdtr.base  = (uint32_t)&gdt[0];
+
+    gdt_flush((uint32_t)&gdtr);
+
+    kprintf("GDT: cargada (%d entradas)\n", GDT_ENTRIES);
+}
+
+// =====================================================================
+// Descriptor TSS (2 entradas, 16 bytes)
+// =====================================================================
+extern "C" void gdt_set_tss(int index, uint32_t base, uint32_t limit) {
+    // OJO: index es el índice del descriptor TSS.
+    // El TSS ocupa 2 entradas de 8 bytes consecutivas.
+    uint8_t *desc = (uint8_t*)&gdt[index];
+
+    // Bytes 0-1: límite[15:0]
+    desc[0] = limit & 0xFF;
+    desc[1] = (limit >> 8) & 0xFF;
+
+    // Bytes 2-4: base[23:0]
+    desc[2] = base & 0xFF;
+    desc[3] = (base >> 8) & 0xFF;
+    desc[4] = (base >> 16) & 0xFF;
+
+    // Byte 5: acceso = 0x89 (present, DPL=0, tipo=1001 TSS 32-bit disponible)
+    desc[5] = 0x89;
+
+    // Byte 6: límite[19:16] (bits 0-3) + flags (bits 4-7)
+    //         flags = 0x00 (TSS no usa granularidad de página)
+    desc[6] = (limit >> 16) & 0x0F;
+
+    // Byte 7: base[31:24]
+    desc[7] = (base >> 24) & 0xFF;
+
+    // Bytes 8-15: base[32:63] = 0 (no usado en 32-bit)
+    for (int i = 8; i < 16; i++) desc[i] = 0;
+}
+
+********
+
+===== gdt.asm =====
+
+format ELF
+use32
+
+public gdt_flush
+
+section '.text' executable
+
+; void gdt_flush(uint32_t gdtr_addr);
+;   [esp+4] = dirección de la estructura GDTDescriptor
+gdt_flush:
+    mov eax, [esp + 4]
+    lgdt [eax]
+
+    ; Recargar los segmentos de datos con el selector 0x10
+    mov ax, 0x10
+    mov ds, ax
+    mov es, ax
+    mov fs, ax
+    mov gs, ax
+    mov ss, ax
+
+    ; Recargar CS con un far jump
+    jmp 0x08:.reload_cs
+.reload_cs:
+    ret
+
+********
+
+===== paging.cpp =====
+
+// paging.cpp
+#include "paging.h"
+#include "screen.h"
+
+static unsigned int page_directory[1024] __attribute__((aligned(4096)));
+static unsigned int page_table_0[1024]   __attribute__((aligned(4096)));
+
+#define PT_POOL_SIZE 64   // 32 PTs = 128 MB mapeables
+static unsigned int pt_pool[PT_POOL_SIZE][1024] __attribute__((aligned(4096)));
+static int pt_pool_next = 0;
+
+extern "C" void paging_enable_asm(unsigned int pd_phys);
+
+extern "C" void paging_init() {
+    for (int i = 0; i < 1024; i++) {
+        page_directory[i] = 0;
+        page_table_0[i]   = 0;
+    }
+
+    // Mapear los primeros 128 MB de RAM linealmente (identidad) en ring 0.
+    // 32 page tables * 4 MB = 128 MB
+    int PTs_needed = 32;   
+    if (PTs_needed > PT_POOL_SIZE) PTs_needed = PT_POOL_SIZE;
+
+    for (int pt_i = 0; pt_i < PTs_needed; pt_i++) {
+        unsigned int *pt;
+        if (pt_i == 0) {
+            pt = page_table_0;
+        } else {
+            pt = pt_pool[pt_i];
+        }
+
+        // Base física = pt_i * 4 MB.
+        unsigned int base_phys = pt_i * 0x400000;
+
+        for (int i = 0; i < 1024; i++) {
+            pt[i] = (base_phys + i * 0x1000) | PTE_PRESENT | PTE_RW;
+        }
+
+        page_directory[pt_i] = ((unsigned int)pt) | PTE_PRESENT | PTE_RW;
+    }
+
+    kprintf("paging: %d MB mapeados (0x0 - 0x%x)\n",
+            PTs_needed * 4, PTs_needed * 0x400000);
+}
+
+extern "C" void paging_enable_now() {
+    paging_enable_asm((unsigned int)page_directory);
+}
+
+extern "C" void paging_map(unsigned int virt, unsigned int phys, unsigned int flags) {
+    unsigned int pd_index = virt >> 22;
+    unsigned int pt_index = (virt >> 12) & 0x3FF;
+
+    if (!(page_directory[pd_index] & PTE_PRESENT)) {
+        if (pt_pool_next >= PT_POOL_SIZE) return;
+
+        unsigned int *new_pt = pt_pool[pt_pool_next++];
+        for (int i = 0; i < 1024; i++) new_pt[i] = 0;
+
+        unsigned int pde_flags = PTE_PRESENT | PTE_RW;
+        if (flags & PTE_USER) pde_flags |= PTE_USER;
+        page_directory[pd_index] = ((unsigned int)new_pt) | pde_flags;
+    } else {
+        // CRÍTICO: Si el PDE ya existe, pero el llamador pide PTE_USER,
+        // hay que añadírselo al PDE también (los permisos son jerárquicos).
+        if ((flags & PTE_USER) && !(page_directory[pd_index] & PTE_USER)) {
+            page_directory[pd_index] |= PTE_USER;
+        }
+    }
+
+    unsigned int *pt = (unsigned int*)(page_directory[pd_index] & 0xFFFFF000);
+    
+    // Escribir el PTE: preservar flags anteriores si el nuevo no los tiene
+    unsigned int new_pte = (phys & 0xFFFFF000) | PTE_PRESENT;
+    if (flags & PTE_RW)   new_pte |= PTE_RW;
+    if (flags & PTE_USER) new_pte |= PTE_USER;
+    pt[pt_index] = new_pte;
+
+    asm volatile("invlpg (%0)" : : "r"(virt) : "memory");
+}
+
+// CORREGIDO: size_kb se convierte a número de páginas (4KB cada una).
+extern "C" void paging_map_range(unsigned int virt, unsigned int phys, unsigned int size_kb, unsigned int flags) {
+    unsigned int pages = (size_kb * 1024) / 4096; // Convertir KB a páginas
+    if (pages == 0) pages = 1;
+    
+    for (unsigned int i = 0; i < pages; i++) {
+        paging_map(virt + i * 0x1000, phys + i * 0x1000, flags);
+    }
+}
+
+extern "C" unsigned int paging_get_pd_addr()  { return (unsigned int)page_directory; }
+extern "C" unsigned int paging_get_pt0_addr() { return (unsigned int)page_table_0; }
+
+extern "C" void paging_flush_tlb(void) {
+    unsigned int cr3;
+    asm volatile("mov %%cr3, %0" : "=r"(cr3));
+    asm volatile("mov %0, %%cr3" :: "r"(cr3) : "memory");
+}
+
+********
+
+===== paging.asm =====
+
+format ELF
+use32
+
+public paging_enable_asm
+
+section '.text' executable
+
+paging_enable_asm:
+    mov eax, [esp + 4]
+    mov cr3, eax
+    mov eax, cr0
+    or eax, 0x80000000
+    mov cr0, eax
+    ret
