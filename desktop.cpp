@@ -13,30 +13,6 @@
 #include "shell.h"
 
 // =====================================================================
-// >>> INICIO BLOQUE DE TEST FAT32 <<<
-// Este bloque es SOLO para probar fat32_win.cpp.
-// Cuando fat32 funcione, BORRA este bloque completo
-// (desde aqui hasta ">>> FIN BLOQUE DE TEST FAT32 <<<").
-// =====================================================================
-extern "C" uint32_t fat32_scan(void);
-extern "C" int fat32_mount(uint32_t part_lba);
-extern "C" int fat32_list(const char *path,
-                          void (*cb)(const char *name, uint32_t size,
-                                     uint8_t attr, uint32_t cluster));
-
-/* Callback que se llama por cada entrada del directorio */
-static void fat32_test_list_cb(const char *name, uint32_t size,
-                               uint8_t attr, uint32_t cluster)
-{
-    (void)cluster;
-    kprintf("[FAT32]   '%s'  %u bytes%s\n",
-            name, size, (attr & 0x10) ? "  <DIR>" : "");
-}
-// =====================================================================
-// >>> FIN BLOQUE DE TEST FAT32 <<<
-// =====================================================================
-
-// =====================================================================
 // Callback del menu de inicio
 // =====================================================================
 static int next_term_x = 60;
@@ -109,32 +85,8 @@ void desktop_run(void) {
     composer_force_redraw();
 
     // =================================================================
-    // >>> INICIO LLAMADA DE TEST A FAT32 <<<
-    // Esta llamada es SOLO para probar fat32_win.cpp.
-    // Cuando fat32 funcione, BORRA este bloque completo
-    // (desde aqui hasta ">>> FIN LLAMADA DE TEST A FAT32 <<<").
-    // =================================================================
-    kprintf("\n[TEST] Buscando particion FAT32...\n");
-    uint32_t lba = fat32_scan();
-    
-    if (lba) {
-        kprintf("[TEST] FAT32 encontrada en LBA %u. Montando...\n", lba);
-        int fat32_ok = fat32_mount(lba);
-        kprintf("[TEST] fat32_mount devolvio %d\n", fat32_ok);
-        
-        if (fat32_ok) {
-            kprintf("[TEST] FAT32 montado correctamente\n");
-            kprintf("[TEST] Listando / ...\n");
-            int n = fat32_list("/", fat32_test_list_cb);
-            kprintf("[TEST] fat32_list devolvio %d\n", n);
-        } else {
-            kprintf("[TEST] FAT32 NO se pudo montar\n");
-        }
-    } else {
-        kprintf("[TEST] No se encontro ninguna particion FAT32\n");
-    }
-    // =================================================================
-    // >>> FIN LLAMADA DE TEST A FAT32 <<<
+    // Nota: El test de FAT32 ha sido removido para evitar doble montura.
+    // La shell o el kernel se encargan de la inicializacion ahora.
     // =================================================================
 
     while (1) {
@@ -177,14 +129,7 @@ void desktop_run(void) {
 
 // =====================================================================
 // Stubs para screen.cpp
-//
-// term_wid, term_prompt y dirty_union son simbolos que screen.cpp
-// usa para redirigir la salida al terminal grafico. Como no tenemos
-// terminal.cpp con esas definiciones, las dejamos como stubs.
-// En la practica nunca se ejecutan porque screen_set_terminal_mode(1)
-// no se llama desde el kernel.
 // =====================================================================
-
 extern "C" int term_wid = -1;
 
 extern "C" void term_prompt(void) {
