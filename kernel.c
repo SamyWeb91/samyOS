@@ -22,21 +22,16 @@
 #include "pat.h"
 #include "ramdisk.h"
 
-// Declarado en screen.cpp
 void screen_set_gfx_mode(void);
+extern "C" uint32_t fat32_scan(void);
+extern "C" int fat32_mount(uint32_t part_lba);
 
-// =====================================================================
-// Buffer estatico del ramdisk (en .bss, no en stack)
-// =====================================================================
+// Llamamos al CARGADOR (ring3_test_run)
+extern "C" void ring3_test_run(void);
+
 static unsigned char ramdisk_buffer[64 * 1024] __attribute__((aligned(4096)));
 
-// =====================================================================
-// kernel_main
-// =====================================================================
 extern "C" void kernel_main(void) {
-    // =============================================================
-    // PASO 1: init básico
-    // =============================================================
     idt_init();
     gdt_init();
     tss_init();
@@ -44,121 +39,66 @@ extern "C" void kernel_main(void) {
     pit_init(100);
     keyboard_init();
 
-    // =============================================================
-    // PASO 2: paging ANTES que el heap
-    // =============================================================
     paging_init();
     paging_enable_now();
-
-    // =============================================================
-    // PASO 2.5: PAT para write-combining del framebuffer
-    // =============================================================
     pat_init();
-
-    // =============================================================
-    // PASO 3: heap
-    // =============================================================
     heap_init();
 
-    // =============================================================
-    // PASO 3.5: ramdisk estatico
-    // =============================================================
     {
-        int rd = ramdisk_create_static((unsigned int)ramdisk_buffer,
-                                       (unsigned int)sizeof(ramdisk_buffer));
-        if (rd >= 0) {
-            kprintf("Ramdisk: id=%d, %u bytes\n",
-                    rd, (unsigned int)sizeof(ramdisk_buffer));
-        } else {
-            kprintf("Ramdisk: no se pudo crear\n");
-        }
+        int rd = ramdisk_create_static((unsigned int)ramdisk_buffer, sizeof(ramdisk_buffer));
+        if (rd >= 0) kprintf("Ramdisk: id=%d\n", rd);
     }
 
-    // =============================================================
-    // PASO 4: VBE + GFX + Backbuffer
-    // =============================================================
     vbe_init();
-
     if (vbe_available()) {
         gfx_init();
-
         gfx_backbuffer_init();
         gfx_clear(0x00000000);
         gfx_backbuffer_flip();
-
         screen_set_gfx_mode();
-
-        kprintf("MiniOS v7.3\n");
-        kprintf("=================\n\n");
-        kprintf("VBE: %ux%u %ubpp\n",
-                vbe_width(), vbe_height(), vbe_bpp());
-        kprintf("FB:  %x  pitch=%u bytes\n",
-                vbe_fb_addr(), vbe_pitch());
-        kprintf("\n");
+        kprintf("SamyOS v0.10.1 \n=================\n\n");
     } else {
-        kprintf("VBE no disponible, sigo en modo texto\n");
+        kprintf("VBE no disponible\n");
     }
 
-    // =============================================================
-    // PASO 5: resto del init
-    // =============================================================
-    kprintf("IDT cargada\n");
-    kprintf("GDT recargada\n");
-    kprintf("TSS cargado\n");
-    kprintf("PIC remapeado\n");
-    kprintf("PIT a 100 Hz\n");
-    kprintf("Teclado listo\n");
-    kprintf("Paging activado\n");
-    kprintf("Heap inicializado\n");
+    kprintf("IDT, GDT, TSS, PIC, PIT, Teclado, Paging, Heap OK\n");
 
-    // =============================================================
-    // PASO 5.5: AHCI (solo lectura)   /* === AHCI === */
-    // =============================================================
+    // Iniciar AHCI y FAT32
     kprintf("Iniciando AHCI...\n");
     if (ahci_init()) {
-        unsigned int sec = (unsigned int)ahci_get_sector_count();
-        unsigned int mib = (unsigned int)((sec * 512ULL) / (1024ULL * 1024ULL));
-        kprintf("AHCI: %u sectores (%u MiB), puerto %d\n",
-                sec, mib, ahci_get_port_index());
+        kprintf("AHCI OK\n");
     } else {
         kprintf("AHCI: no disponible\n");
     }
 
-    kprintf("\n");
     syscall_init();
     user_init();
 
-    kprintf("\n");
-    kprintf("AHCI: modo solo lectura activo\n");   /* === AHCI === */
+    kprintf("Iniciando FAT32...\n");
+    uint32_t fat_lba = fat32_scan();
+    if (fat_lba && fat32_mount(fat_lba)) {
+        kprintf("FAT32: Montada en LBA %u\n", fat_lba);
+    } else {
+        kprintf("FAT32: Error\n");
+    }
 
-    kprintf("\n");
     thread_init();
-
-    kprintf("Threads listos\n");
-
-    // =============================================================
-    // Subsistema de ventanas
-    // =============================================================
     win_init();
-    kprintf("Ventanas ring 3 listas\n");
 
-    // =============================================================
-    // Activar IRQs ANTES del flip final.
-    // =============================================================
     asm volatile("sti");
 
-    kprintf("\nEscribe 'help' para ver los comandos.\n\n");
-
-    // =============================================================
-    // FLIP FINAL
-    // =============================================================
     if (gfx_backbuffer_active()) {
         gfx_backbuffer_flip();
     }
 
     // =============================================================
-    // Shell: bucle principal
+    // AQUI LLAMAMOS AL CARGADOR (que hará el salto al binario en Ring 3)
     // =============================================================
+    kprintf("\n!!! LLAMANDO AL CARGADOR RING 3 !!!\n");
+    ring3_test_run();
+
+    // Si el binario termina y vuelve, caemos al escritorio
+    kprintf("\nVolviendo al escritorio...\n");
     desktop_run();
 
     while (1) {}

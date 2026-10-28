@@ -17,14 +17,6 @@ extern "C" void paging_init() {
     }
 
     // Mapear los primeros 128 MB de RAM linealmente (identidad).
-    // 128 MB = 32 page tables de 4 MB cada una.
-    // Cubre kernel + heap + backbuffer + espacio de sobra.
-    //
-    // IMPORTANTE: se mapea con PTE_PRESENT | PTE_RW, sin PTE_USER.
-    // El user code NO puede acceder a esta zona directamente.
-    // Si en el futuro quieres userland, usa paging_map con PTE_USER
-    // para las páginas concretas que necesites.
-
     int PTs_needed = 32;   // 32 PTs * 4 MB = 128 MB
     if (PTs_needed > PT_POOL_SIZE) PTs_needed = PT_POOL_SIZE;
 
@@ -36,7 +28,6 @@ extern "C" void paging_init() {
             pt = pt_pool[pt_i];
         }
 
-        // Cada entry cubre 4 KB. Base física = pt_i * 4 MB.
         unsigned int base_phys = pt_i * 0x400000;
 
         for (int i = 0; i < 1024; i++) {
@@ -65,18 +56,26 @@ extern "C" void paging_map(unsigned int virt, unsigned int phys, unsigned int fl
         for (int i = 0; i < 1024; i++) new_pt[i] = 0;
 
         unsigned int pde_flags = PTE_PRESENT | PTE_RW;
-        if (flags & PTE_USER) {
-            pde_flags |= PTE_USER;
-        }
+        if (flags & PTE_USER) pde_flags |= PTE_USER;
+        
         page_directory[pd_index] = ((unsigned int)new_pt) | pde_flags;
     } else {
+        // Si el PDE ya existía (como los primeros 128 MB), le añadimos PTE_USER
         if ((flags & PTE_USER) && !(page_directory[pd_index] & PTE_USER)) {
             page_directory[pd_index] |= PTE_USER;
         }
     }
 
     unsigned int *pt = (unsigned int*)(page_directory[pd_index] & 0xFFFFF000);
-    pt[pt_index] = (phys & 0xFFFFF000) | (flags & 0xFFF) | PTE_PRESENT;
+    
+    // FIX CRÍTICO: Escribir el PTE asegurando que los flags de usuario se mantengan
+    // en el nivel inferior (Page Table). Si no hacemos esto, el iret fallará.
+    unsigned int new_pte = (phys & 0xFFFFF000) | PTE_PRESENT;
+    if (flags & PTE_RW)   new_pte |= PTE_RW;
+    if (flags & PTE_USER) new_pte |= PTE_USER;
+    if (flags & PTE_PAT)  new_pte |= PTE_PAT;
+
+    pt[pt_index] = new_pte;
 
     asm volatile("invlpg (%0)" : : "r"(virt) : "memory");
 }

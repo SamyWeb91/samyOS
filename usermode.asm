@@ -2,8 +2,8 @@ format ELF
 use32
 
 public enter_user_mode
-extrn tss_set_kernel_stack
-extrn user_get_kernel_stack
+; Nota: Ya no necesitamos tss_set_kernel_stack aquí, 
+; el kernel ya lo configuró antes de llamar a esta función.
 
 section '.text' executable
 
@@ -11,32 +11,35 @@ section '.text' executable
 ;   [esp+4] = entry
 ;   [esp+8] = user_stack
 enter_user_mode:
-    ; Cargar argumentos en registros que NO se van a machacar
-    ; Los guardamos en la pila directamente para no perderlos.
-    mov eax, [esp + 4]      ; EIP del usuario
-    mov edx, [esp + 8]      ; ESP del usuario
+    ; 1. Guardar argumentos en registros seguros
+    mov eax, [esp + 4]      ; EAX = EIP del usuario
+    mov edx, [esp + 8]      ; EDX = ESP del usuario
 
-    ; Guardar EIP y ESP en la pila (aún en el stack del kernel)
-    push eax                ; [esp]   = EIP del usuario
-    push edx                ; [esp+4] = ESP del usuario
+    ; 2. Deshabilitar interrupciones mientras cambiamos de contexto
+    cli
 
-    ; Stack del kernel para el TSS
-    call user_get_kernel_stack
-    mov ecx, eax            ; ECX = stack del kernel para syscalls
-    push ecx
-    call tss_set_kernel_stack
-    add esp, 4
+    ; 3. Limpiar registros de segmento para no arrastrar basura
+    xor ebx, ebx
+    xor ecx, ecx
+    xor esi, esi
+    xor edi, edi
+    xor ebp, ebp
 
-    ; Recuperar EIP y ESP (en orden inverso)
-    pop edx                 ; EDX = ESP del usuario
-    pop eax                 ; EAX = EIP del usuario
+    ; 4. Construir el frame para el iretd
+    ; Orden EXACTO en la pila (de arriba a abajo): SS, ESP, EFLAGS, CS, EIP
+    push 0x23               ; SS  = user data | RPL 3
+    push edx                ; ESP = pila del usuario
+    push 0x202              ; EFLAGS = IF=1
+    push 0x1B               ; CS  = user code | RPL 3
+    push eax                ; EIP = punto de entrada del usuario
 
-    ; Construir el stack para iret (empujar en orden inverso)
-    ;   [SS]  [ESP]  [EFLAGS]  [CS]  [EIP]
-    ; El último push es el que iret pop primero.
-    push 0x23               ; SS = user data | RPL 3
-    push edx                ; ESP del usuario
-    push 0x202              ; EFLAGS (IF=1)
-    push 0x1B               ; CS = user code | RPL 3
-    push eax                ; EIP del usuario
+    ; 5. Cargar los selectores de datos de usuario (¡CRÍTICO EN HARDWARE REAL!)
+    ; Si no hacemos esto, el ELF intentará usar DS=0x10 (kernel) y fallará.
+    mov cx, 0x23
+    mov ds, cx
+    mov es, cx
+    mov fs, cx
+    mov gs, cx
+
+    ; 6. ¡Salto a ring 3!
     iretd

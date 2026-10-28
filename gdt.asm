@@ -6,7 +6,6 @@ public gdt_flush
 section '.text' executable
 
 ; void gdt_flush(uint32_t gdtr_addr);
-;   [esp+4] = dirección de la estructura GDTDescriptor
 gdt_flush:
     mov eax, [esp + 4]
     lgdt [eax]
@@ -19,7 +18,9 @@ gdt_flush:
     mov gs, ax
     mov ss, ax
 
-    ; Recargar CS con un far jump
-    jmp 0x08:.reload_cs
+    ; Recargar CS usando un push/retf (más seguro en hardware real)
+    push 0x08
+    push .reload_cs
+    retf
 .reload_cs:
     ret

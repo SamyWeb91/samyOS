@@ -20,9 +20,10 @@ extern "C" void tss_init(void) {
     // esp0 = 0 por ahora. Se configura en cada cambio de proceso (futuro ring 3).
     tss.esp0 = 0;
 
-    // iomap_base = sizeof(TSS) → sin bitmap de I/O
-    // (si fuera menor, la CPU leería basura y daría #GP al hacer I/O)
-    tss.iomap_base = sizeof(TSS);
+    // FIX CRÍTICO PARA HARDWARE REAL:
+    // Si ponemos sizeof(TSS), el procesador a veces cree que hay un bitmap de I/O inválido
+    // y lanza un #GP al hacer iret hacia Ring 3. Con 0xFFFF le decimos que no hay bitmap.
+    tss.iomap_base = 0xFFFF;
 
     // Registrar el descriptor en la GDT.
     // Índice 5 → selector 0x28.

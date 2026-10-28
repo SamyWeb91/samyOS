@@ -5,10 +5,12 @@
 #include "rtc.h"
 #include "pit.h"
 #include "composer.h"
-#include "folder.h"
 #include "ahci.h"
 #include "disk.h"
 #include "fat32.h"
+
+/* Prueba aislada de ring 3 (ring3_test.cpp) */
+extern "C" void ring3_test_run(void);
 
 /* =====================================================================
  * Forward declarations
@@ -117,13 +119,13 @@ static void cmd_help(int wid) {
     term_println(wid, "  help       - esta ayuda");
     term_println(wid, "  clear      - limpiar terminal");
     term_println(wid, "  date       - fecha y hora");
-    term_println(wid, "  files      - gestor grafico de archivos");
     term_println(wid, "  ls         - listar archivos (FAT32)");
     term_println(wid, "  cat <n>    - mostrar archivo (FAT32)");
     term_println(wid, "  info       - info de FAT32 montada");
     term_println(wid, "  disk       - estado del disco AHCI");
     term_println(wid, "  partitions - lista particiones");
     term_println(wid, "  hex <lba>  - volcar sector");
+    term_println(wid, "  ring3      - cargar TEST.BIN del disco y ejecutar en Ring 3");
     term_println(wid, "  close      - cerrar esta ventana");
 }
 
@@ -140,12 +142,14 @@ static void cmd_date(int wid) {
     term_println(wid, buf);
 }
 
+/* Comentado porque folder ya no se usa
 static void cmd_files(int wid) {
     if (folder_open(120, 100, 400, 320) < 0)
         term_println(wid, "files: no se pudo abrir");
     else
         term_println(wid, "files: abriendo gestor");
 }
+*/
 
 static void cmd_fatls(int wid, const char *path) {
     if (!fat32_is_mounted()) {
@@ -201,7 +205,7 @@ static void cmd_execute(int wid, ShellTerm *t, const char *cmd) {
     else if (str_eq(cmd, "partitions"))         disk_cmd_partitions(wid);
     else if (str_starts_with(cmd, "hex "))      disk_cmd_hex(wid, cmd + 4);
 
-    /* Comandos de FAT32 (renombrados a ls, cat, info) */
+    /* Comandos de FAT32 */
     else if (str_eq(cmd, "ls"))                 cmd_fatls(wid, "/");
     else if (str_starts_with(cmd, "ls "))       cmd_fatls(wid, cmd + 3);
     else if (str_starts_with(cmd, "cat "))      cmd_fatcat(wid, cmd + 4);
@@ -211,8 +215,11 @@ static void cmd_execute(int wid, ShellTerm *t, const char *cmd) {
     else if (str_eq(cmd, "help"))         cmd_help(wid);
     else if (str_eq(cmd, "clear"))        win_sys_clear(wid);
     else if (str_eq(cmd, "date"))         cmd_date(wid);
-    else if (str_eq(cmd, "files"))        cmd_files(wid);
-    
+    // else if (str_eq(cmd, "files"))        cmd_files(wid); // Comentado
+
+    /* Prueba de ring 3 */
+    else if (str_eq(cmd, "ring3"))        ring3_test_run();
+
     else if (str_eq(cmd, "close")) {
         composer_dirty_window(wid);
         t->wid = -1;
@@ -270,10 +277,12 @@ extern "C" int shell_new_terminal(int x, int y, int w, int h, const char *title)
 extern "C" void shell_handle_key(int wid, char c) {
     if (wid < 0) return;
 
+    /* Comentado porque folder ya no se usa
     if (folder_is_folder(wid)) {
         folder_handle_key(wid, c);
         return;
     }
+    */
 
     ShellTerm *t = 0;
     for (int i = 0; i < SHELL_MAX_TERMS; i++) {
