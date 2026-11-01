@@ -2,44 +2,40 @@ format ELF
 use32
 
 public enter_user_mode
-; Nota: Ya no necesitamos tss_set_kernel_stack aquí, 
-; el kernel ya lo configuró antes de llamar a esta función.
+public user_mode_entry
 
 section '.text' executable
 
 ; void enter_user_mode(uint32_t entry, uint32_t user_stack);
-;   [esp+4] = entry
-;   [esp+8] = user_stack
 enter_user_mode:
-    ; 1. Guardar argumentos en registros seguros
-    mov eax, [esp + 4]      ; EAX = EIP del usuario
-    mov edx, [esp + 8]      ; EDX = ESP del usuario
+    mov eax, [esp + 4]      ; EIP
+    mov edx, [esp + 8]      ; ESP de usuario
 
-    ; 2. Deshabilitar interrupciones mientras cambiamos de contexto
     cli
 
-    ; 3. Limpiar registros de segmento para no arrastrar basura
-    xor ebx, ebx
-    xor ecx, ecx
-    xor esi, esi
-    xor edi, edi
-    xor ebp, ebp
+    ; Frame del iretd (solo esto)
+    push 0x23               ; SS
+    push edx                ; ESP
+    push 0x202              ; EFLAGS (IF = 1)
+    push 0x1B               ; CS
+    push eax                ; EIP
 
-    ; 4. Construir el frame para el iretd
-    ; Orden EXACTO en la pila (de arriba a abajo): SS, ESP, EFLAGS, CS, EIP
-    push 0x23               ; SS  = user data | RPL 3
-    push edx                ; ESP = pila del usuario
-    push 0x202              ; EFLAGS = IF=1
-    push 0x1B               ; CS  = user code | RPL 3
-    push eax                ; EIP = punto de entrada del usuario
+    ; NO tocamos DS, ES, FS, GS aquí.
+    iretd
 
-    ; 5. Cargar los selectores de datos de usuario (¡CRÍTICO EN HARDWARE REAL!)
-    ; Si no hacemos esto, el ELF intentará usar DS=0x10 (kernel) y fallará.
-    mov cx, 0x23
-    mov ds, cx
-    mov es, cx
-    mov fs, cx
-    mov gs, cx
+; void user_mode_entry(uint32_t eip, uint32_t esp, uint32_t eflags, uint32_t cs, uint32_t ss);
+; Esta funcion la usa el planificador
+user_mode_entry:
+    mov eax, [esp + 4]
+    mov edx, [esp + 8]
+    mov ecx, [esp + 12]
+    mov ebx, [esp + 16]
+    mov esi, [esp + 20]
 
-    ; 6. ¡Salto a ring 3!
+    cli
+    push esi
+    push edx
+    push ecx
+    push ebx
+    push eax
     iretd

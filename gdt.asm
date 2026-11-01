@@ -18,9 +18,7 @@ gdt_flush:
     mov gs, ax
     mov ss, ax
 
-    ; Recargar CS usando un push/retf (más seguro en hardware real)
-    push 0x08
-    push .reload_cs
-    retf
+    ; Recargar CS usando un far jump (más seguro que retf)
+    jmp 0x08:.reload_cs
 .reload_cs:
     ret

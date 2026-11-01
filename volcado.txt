@@ -1,97 +1,60 @@
 ************
-ARCHIVO: paging.cpp
+ARCHIVO: tss.cpp
 ************
-#include "paging.h"
+#include "tss.h"
+#include "gdt.h"
 #include "screen.h"
 
-static unsigned int page_directory[1024] __attribute__((aligned(4096)));
-static unsigned int page_table_0[1024]   __attribute__((aligned(4096)));
+// FIX: Alinear la estructura a 4 bytes para que el hardware real la lea bien
+static TSS tss __attribute__((aligned(4)));
 
-#define PT_POOL_SIZE 64   // 32 PTs = 128 MB mapeables
-static unsigned int pt_pool[PT_POOL_SIZE][1024] __attribute__((aligned(4096)));
-static int pt_pool_next = 0;
+extern "C" void tss_flush(void);   // en tss.asm
 
-extern "C" void paging_enable_asm(unsigned int pd_phys);
+extern "C" void tss_init(void) {
+    uint8_t *p = (uint8_t*)&tss;
+    for (unsigned int i = 0; i < sizeof(TSS); i++) p[i] = 0;
 
-extern "C" void paging_init() {
-    for (int i = 0; i < 1024; i++) {
-        page_directory[i] = 0;
-        page_table_0[i]   = 0;
-    }
+    // ss0 = 0x10 (segmento de datos del kernel con RPL=0)
+    tss.ss0 = 0x10;
 
-    // Mapear los primeros 128 MB de RAM linealmente (identidad).
-    // 128 MB = 32 page tables de 4 MB cada una.
-    // Cubre kernel + heap + backbuffer + espacio de sobra.
-    //
-    // IMPORTANTE: se mapea con PTE_PRESENT | PTE_RW, sin PTE_USER.
-    // El user code NO puede acceder a esta zona directamente.
-    // Si en el futuro quieres userland, usa paging_map con PTE_USER
-    // para las páginas concretas que necesites.
+    // esp0 se llena al hacer el salto a Ring 3
+    tss.esp0 = 0;
 
-    int PTs_needed = 32;   // 32 PTs * 4 MB = 128 MB
-    if (PTs_needed > PT_POOL_SIZE) PTs_needed = PT_POOL_SIZE;
+    // iomap_base > límite del TSS para decir "no hay bitmap"
+    tss.iomap_base = sizeof(TSS) + 1;
 
-    for (int pt_i = 0; pt_i < PTs_needed; pt_i++) {
-        unsigned int *pt;
-        if (pt_i == 0) {
-            pt = page_table_0;
-        } else {
-            pt = pt_pool[pt_i];
-        }
+    // Registrar el descriptor en la GDT.
+    gdt_set_tss(5, (uint32_t)&tss, sizeof(TSS) - 1);
 
-        // Cada entry cubre 4 KB. Base física = pt_i * 4 MB.
-        unsigned int base_phys = pt_i * 0x400000;
+    // Cargar el TSS
+    tss_flush();
 
-        for (int i = 0; i < 1024; i++) {
-            pt[i] = (base_phys + i * 0x1000) | PTE_PRESENT | PTE_RW;
-        }
-
-        page_directory[pt_i] = ((unsigned int)pt) | PTE_PRESENT | PTE_RW;
-    }
-
-    kprintf("paging: %d MB mapeados (0x0 - 0x%x)\n",
-            PTs_needed * 4, PTs_needed * 0x400000);
+    kprintf("TSS: cargado en 0x28 (base=%x, limit=%u, ss0=0x%x)\n",
+            (uint32_t)&tss, sizeof(TSS) - 1, tss.ss0);
 }
 
-extern "C" void paging_enable_now() {
-    paging_enable_asm((unsigned int)page_directory);
+extern "C" void tss_set_kernel_stack(uint32_t esp0) {
+    tss.esp0 = esp0;
 }
 
-extern "C" void paging_map(unsigned int virt, unsigned int phys, unsigned int flags) {
-    unsigned int pd_index = virt >> 22;
-    unsigned int pt_index = (virt >> 12) & 0x3FF;
+************
 
-    if (!(page_directory[pd_index] & PTE_PRESENT)) {
-        if (pt_pool_next >= PT_POOL_SIZE) return;
+************
+ARCHIVO: tss.asm
+************
+format ELF
+use32
 
-        unsigned int *new_pt = pt_pool[pt_pool_next++];
-        for (int i = 0; i < 1024; i++) new_pt[i] = 0;
+public tss_flush
 
-        unsigned int pde_flags = PTE_PRESENT | PTE_RW;
-        if (flags & PTE_USER) {
-            pde_flags |= PTE_USER;
-        }
-        page_directory[pd_index] = ((unsigned int)new_pt) | pde_flags;
-    } else {
-        if ((flags & PTE_USER) && !(page_directory[pd_index] & PTE_USER)) {
-            page_directory[pd_index] |= PTE_USER;
-        }
-    }
+section '.text' executable
 
-    unsigned int *pt = (unsigned int*)(page_directory[pd_index] & 0xFFFFF000);
-    pt[pt_index] = (phys & 0xFFFFF000) | (flags & 0xFFF) | PTE_PRESENT;
-
-    asm volatile("invlpg (%0)" : : "r"(virt) : "memory");
-}
-
-extern "C" void paging_map_range(unsigned int virt, unsigned int phys, unsigned int size_kb, unsigned int flags) {
-    for (unsigned int i = 0; i < size_kb; i++) {
-        paging_map(virt + i * 0x1000, phys + i * 0x1000, flags);
-    }
-}
-
-extern "C" unsigned int paging_get_pd_addr()  { return (unsigned int)page_directory; }
-extern "C" unsigned int paging_get_pt0_addr() { return (unsigned int)page_table_0; }
+; Carga el TSS en el registro TR.
+; El selector 0x28 = índice 5 * 8 + RPL 0.
+tss_flush:
+    mov ax, 0x28
+    ltr ax
+    ret
 
 ************
 
@@ -102,37 +65,54 @@ format ELF
 use32
 
 public enter_user_mode
-extrn tss_set_kernel_stack
+public user_mode_entry
 
 section '.text' executable
 
 ; void enter_user_mode(uint32_t entry, uint32_t user_stack);
-;   [esp+4] = entry
-;   [esp+8] = user_stack
 enter_user_mode:
-    ; 1. Guardar argumentos en registros seguros
-    mov eax, [esp + 4]      ; EAX = EIP del usuario
-    mov edx, [esp + 8]      ; EDX = ESP del usuario
+    mov eax, [esp + 4]      ; EIP
+    mov edx, [esp + 8]      ; ESP
 
-    ; 2. Deshabilitar interrupciones mientras cambiamos de contexto
     cli
 
-    ; 3. Limpiar registros de segmento para no arrastrar basura
-    xor ebx, ebx
-    xor ecx, ecx
-    xor esi, esi
-    xor edi, edi
-    xor ebp, ebp
+    ; Frame del iretd: SS, ESP, EFLAGS, CS, EIP
+    push 0x23               ; SS (RPL=3)
+    push edx                ; ESP
+    push 0x202              ; EFLAGS
+    push 0x1B               ; CS (RPL=3)
+    push eax                ; EIP
 
-    ; 4. Construir el frame para el iretd
-    ; Orden EXACTO en la pila: SS, ESP, EFLAGS, CS, EIP
-    push 0x23               ; SS  = user data | RPL 3
-    push edx                ; ESP = pila del usuario
-    push 0x202              ; EFLAGS = IF=1
-    push 0x1B               ; CS  = user code | RPL 3
-    push eax                ; EIP = punto de entrada del usuario
+    ; Cargar los segmentos de datos de usuario
+    mov cx, 0x23
+    mov ds, cx
+    mov es, cx
+    mov fs, cx
+    mov gs, cx
 
-    ; 5. ¡Salto a ring 3!
+    iretd
+
+; void user_mode_entry(uint32_t eip, uint32_t esp, uint32_t eflags, uint32_t cs, uint32_t ss);
+; Esta funcion es llamada desde el planificador (thread.cpp)
+user_mode_entry:
+    mov eax, [esp + 4]  ; eip
+    mov edx, [esp + 8]  ; esp
+    mov ecx, [esp + 12] ; eflags
+    mov ebx, [esp + 16] ; cs
+    mov esi, [esp + 20] ; ss
+
+    cli
+    push esi            ; SS
+    push edx            ; ESP
+    push ecx            ; EFLAGS
+    push ebx            ; CS
+    push eax            ; EIP
+
+    mov cx, 0x23
+    mov ds, cx
+    mov es, cx
+    mov fs, cx
+    mov gs, cx
     iretd
 
 ************
@@ -154,6 +134,9 @@ ARCHIVO: ring3_test.cpp
 
 static uint8_t file_buffer[65536];
 static uint8_t ring3_kernel_stack[8192] __attribute__((aligned(16)));
+
+// Variable para guardar la pila del kernel antes del salto
+static unsigned int kernel_esp_save = 0;
 
 // Estructuras ELF32
 typedef struct {
@@ -193,6 +176,7 @@ extern "C" void paging_map(unsigned int virt, unsigned int phys, unsigned int fl
 extern "C" int fat32_read_cluster_raw(uint32_t cluster, void *buf);
 extern "C" uint32_t fat32_next_cluster(uint32_t current);
 
+// Callback para buscar A.BIN
 static uint32_t found_cluster = 0;
 static uint32_t found_size = 0;
 
@@ -201,6 +185,13 @@ static void find_file_cb(const char *name, uint32_t size, uint8_t attr, uint32_t
         found_cluster = cluster;
         found_size = size;
     }
+}
+
+// Funcion que se ejecuta cuando el ELF llama a SYS_EXIT
+extern "C" void ring3_volver_kernel(void) {
+    // Restaurar la pila del kernel que guardamos antes del salto
+    asm volatile("mov %0, %%esp" :: "r"(kernel_esp_save));
+    asm volatile("ret");
 }
 
 extern "C" void ring3_test_run(void) {
@@ -303,11 +294,15 @@ extern "C" void ring3_test_run(void) {
     kprintf("ring3: TSS.esp0 = 0x%x\n", esp0);
     kprintf("ring3: EIP = 0x%x, CS = 0x1b, SS = 0x23\n", ehdr->e_entry);
 
+    // GUARDAMOS LA PILA DEL KERNEL ANTES DE SALTAR
+    asm volatile("mov %%esp, %0" : "=r"(kernel_esp_save));
+
     // AQUI FORZAMOS EL CAMBIO DE ANILLO
     kprintf("ring3: EJECUTANDO IRETD AHORA!!!\n");
     enter_user_mode(ehdr->e_entry, USER_STACK_TOP);
 
-    kprintf("ring3: Volvimos (esto no deberia pasar)\n");
+    // Si el A.BIN hace SYS_EXIT, el handler modificara el EIP y volvera aqui
+    kprintf("ring3: Volvimos de Ring 3! Escritorio descongelado.\n");
 }
 
 ************

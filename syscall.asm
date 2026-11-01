@@ -2,25 +2,46 @@ format ELF
 use32
 
 public isr_128
-extrn syscall_handler
+extrn syscall_handler_c
 
 section '.text' executable
 
-; int 0x80: syscall
-; Similar a isr_common pero llama a syscall_handler en vez de isr_handler.
-; El err_code y int_no son artificiales (push 0 y push 128).
 isr_128:
-    push 0              ; err_code falso
-    push 128            ; int_no falso
     pusha
+    push ds
+    push es
+    push fs
+    push gs
+
+    ; Cargar segmentos del kernel
     mov ax, 0x10
     mov ds, ax
     mov es, ax
     mov fs, ax
     mov gs, ax
-    push esp            ; puntero a Regs
-    call syscall_handler
-    add esp, 4
+
+    ; Offsets correctos DESPUÉS de los 4 push de segmentos
+    mov eax, [esp+44]   ; EAX original del usuario (11 o 0)
+    mov ebx, [esp+32]   ; EBX
+    mov ecx, [esp+40]   ; ECX
+    mov edx, [esp+36]   ; EDX
+    mov esi, [esp+20]   ; ESI
+    mov edi, [esp+16]   ; EDI
+
+    ; Pasamos a C++ (cdecl: derecha a izquierda)
+    push edi
+    push esi
+    push edx
+    push ecx
+    push ebx
+    push eax
+
+    call syscall_handler_c
+    add esp, 24         ; Limpiar los 6 argumentos
+
+    pop gs
+    pop fs
+    pop es
+    pop ds
     popa
-    add esp, 8          ; quitar int_no + err_code
     iretd

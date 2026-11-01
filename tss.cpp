@@ -1,52 +1,46 @@
+// Copyright (C) 2026 Samuel Tamayo Infante
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
 #include "tss.h"
 #include "gdt.h"
 #include "screen.h"
 
-static TSS tss;
+// Alineada a 4 bytes (importante en hardware real)
+static TSS tss __attribute__((aligned(4)));
 
-extern "C" void tss_flush(void);   // en tss.asm
+extern "C" void tss_flush(void);
 
-// =====================================================================
-// Init
-// =====================================================================
 extern "C" void tss_init(void) {
-    // Limpiar la estructura
+    // Limpiar toda la estructura
     uint8_t *p = (uint8_t*)&tss;
     for (unsigned int i = 0; i < sizeof(TSS); i++) p[i] = 0;
 
-    // ss0 = 0x10 (segmento de datos del kernel)
-    tss.ss0 = 0x10;
+    tss.ss0 = 0x10;                 // Data segment del kernel
+    tss.esp0 = 0;                   // Se rellena justo antes de saltar a Ring 3
+    tss.iomap_base = sizeof(TSS);   // No hay I/O bitmap
 
-    // esp0 = 0 por ahora. Se configura en cada cambio de proceso (futuro ring 3).
-    tss.esp0 = 0;
-
-    // FIX CRÍTICO PARA HARDWARE REAL:
-    // Si ponemos sizeof(TSS), el procesador a veces cree que hay un bitmap de I/O inválido
-    // y lanza un #GP al hacer iret hacia Ring 3. Con 0xFFFF le decimos que no hay bitmap.
-    tss.iomap_base = 0xFFFF;
-
-    // Registrar el descriptor en la GDT.
-    // Índice 5 → selector 0x28.
+    // Registrar en la GDT (índice 5 → selector 0x28)
     gdt_set_tss(5, (uint32_t)&tss, sizeof(TSS) - 1);
 
-    // Cargar el TSS en el registro TR
     tss_flush();
 
-    kprintf("TSS: cargado en 0x28 (base=%x, limit=%u, ss0=0x%x)\n",
+    kprintf("TSS: cargado en 0x28 (base=0x%x, limit=%u, ss0=0x%x)\n",
             (uint32_t)&tss, sizeof(TSS) - 1, tss.ss0);
 }
 
-// =====================================================================
-// Set kernel stack (para ring 3)
-// =====================================================================
 extern "C" void tss_set_kernel_stack(uint32_t esp0) {
-    tss.esp0 = esp0;
+    // Alinear a 16 bytes por si acaso
+    tss.esp0 = esp0 & ~0xFu;
 }
-
-// =====================================================================
-// Getters (para shell)
-// =====================================================================
-extern "C" uint32_t tss_get_esp0(void)  { return tss.esp0; }
-extern "C" uint32_t tss_get_ss0(void)   { return tss.ss0; }
-extern "C" uint32_t tss_get_base(void)  { return (uint32_t)&tss; }
-extern "C" uint32_t tss_get_limit(void) { return sizeof(TSS) - 1; }

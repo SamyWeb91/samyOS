@@ -1,3 +1,20 @@
+/*
+ * Copyright (C) 2026 Samuel Tamayo Infante
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
 #pragma once
 
 #include "isr.h"   // para Regs
@@ -24,7 +41,7 @@
 #define SYS_BRK      45
 #define SYS_MMAP     90
 #define SYS_NANOSLEEP 162
-
+#define SYS_DRAW_RECT 11
 /* --- Propias de MiniSO (reservado, a partir del 200) --- */
 /* #define SYS_MINIOS_XXX  200 */
 

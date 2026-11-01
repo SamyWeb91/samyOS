@@ -1,3 +1,20 @@
+/*
+ * Copyright (C) 2026 Samuel Tamayo Infante
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
 // kernel.c
 #include "screen.h"
 #include "idt.h"
@@ -25,9 +42,6 @@
 void screen_set_gfx_mode(void);
 extern "C" uint32_t fat32_scan(void);
 extern "C" int fat32_mount(uint32_t part_lba);
-
-// Llamamos al CARGADOR (ring3_test_run)
-extern "C" void ring3_test_run(void);
 
 static unsigned char ramdisk_buffer[64 * 1024] __attribute__((aligned(4096)));
 
@@ -92,14 +106,11 @@ extern "C" void kernel_main(void) {
     }
 
     // =============================================================
-    // AQUI LLAMAMOS AL CARGADOR (que hará el salto al binario en Ring 3)
+    // INICIAMOS EL ESCRITORIO NORMALMENTE
     // =============================================================
-    kprintf("\n!!! LLAMANDO AL CARGADOR RING 3 !!!\n");
-    ring3_test_run();
-
-    // Si el binario termina y vuelve, caemos al escritorio
-    kprintf("\nVolviendo al escritorio...\n");
+    kprintf("\nIniciando escritorio...\n");
     desktop_run();
 
+    // Si el escritorio termina (no debería), nos quedamos aqui.
     while (1) {}
 }

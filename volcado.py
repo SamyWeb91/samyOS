@@ -1,4 +1,4 @@
-archivos = ["paging.cpp", "usermode.asm", "ring3_test.cpp"]
+archivos = ["tss.cpp", "tss.asm", "usermode.asm", "ring3_test.cpp"]
 
 with open("volcado.txt", "w") as out:
     for f in archivos:
