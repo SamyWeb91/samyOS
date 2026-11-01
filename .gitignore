@@ -15,3 +15,20 @@ bootloader.roto.*
 *~
 *.swp
 .DS_Store
+
+# Backups y archivos comprimidos
+*.zip
+*.bak
+*.save
+*.save.*
+*.7.5.bak
+
+# Binarios y artefactos de compilación
+*.o
+*.bin
+*.img
+*.ppm
+
+# Archivos temporales
+nano
+t
