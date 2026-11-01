@@ -32,3 +32,9 @@ bootloader.roto.*
 # Archivos temporales
 nano
 t
+# Directorios de backups y experimentos
+_basura/
+_experimentos/
+_tags-funcionales/
+funcional-run/
+funcional/
