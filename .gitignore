@@ -38,3 +38,36 @@ _experimentos/
 _tags-funcionales/
 funcional-run/
 funcional/
+
+# Backups y temporales
+*.save
+*.save.*
+A.BIN
+nano
+t
+kernel.c.save*
+ring3_test.cpp.save
+thread.h.save
+tss.asm.save
+
+# Imágenes y capturas
+*.png
+*.ppm
+
+# Imágenes de disco
+disco.img.*
+
+# Logs y volcados
+*.log
+volcado.txt
+volcado.py
+
+# Archivos de prueba
+hola.c
+hola.txt
+
+# Archivo auxiliar de licencia
+gpl_header.txt
+
+# Archivo binario suelto
+paging
