@@ -17,12 +17,50 @@
 
 #pragma once
 
+/*
+ * Layout EXACTO de la pila cuando isr_common llama a isr_handler.
+ *
+ * Orden de push en isr_common (de arriba a abajo en la pila):
+ *
+ *   CPU pushea (si cambia de ring):  SS, ESP, EFLAGS, CS, EIP
+ *   CPU pushea (si la excepción tiene error code): err_code
+ *   Stub pushea:  int_no   (push num)
+ *   Stub pushea:  err_code dummy (push 0)  [solo si NO lo puso el CPU]
+ *   isr_common:   pusha -> EAX, ECX, EDX, EBX, ESP, EBP, ESI, EDI
+ *   isr_common:   push ds, es, fs, gs
+ *
+ * En memoria (direcciones crecientes), el frame queda así:
+ *
+ *   [ESP+0]  = GS
+ *   [ESP+4]  = FS
+ *   [ESP+8]  = ES
+ *   [ESP+12] = DS
+ *   [ESP+16] = EDI
+ *   [ESP+20] = ESI
+ *   [ESP+24] = EBP
+ *   [ESP+28] = ESP (valor antes de pusha)
+ *   [ESP+32] = EBX
+ *   [ESP+36] = EDX
+ *   [ESP+40] = ECX
+ *   [ESP+44] = EAX
+ *   [ESP+48] = int_no
+ *   [ESP+52] = err_code
+ *   [ESP+56] = EIP
+ *   [ESP+60] = CS
+ *   [ESP+64] = EFLAGS
+ *   [ESP+68] = useresp   (solo si cambió de ring)
+ *   [ESP+72] = ss        (solo si cambió de ring)
+ *
+ * El struct Regs debe reflejar EXACTAMENTE ese layout.
+ */
 struct Regs {
-    // pusha
+    // Guardados por isr_common (en este orden en memoria)
+    unsigned int gs, fs, es, ds;
+    // Guardados por pusha (en este orden en memoria)
     unsigned int edi, esi, ebp, esp_dummy, ebx, edx, ecx, eax;
-    // stub
+    // Pusheados por el stub
     unsigned int int_no, err_code;
-    // CPU
+    // Pusheados por la CPU
     unsigned int eip, cs, eflags, useresp, ss;
 };
 

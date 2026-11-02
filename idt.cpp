@@ -1,17 +1,5 @@
 // Copyright (C) 2026 Samuel Tamayo Infante
-//
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-//
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU General Public License for more details.
-//
-// You should have received a copy of the GNU General Public License
-// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+// (licencia GPL igual que antes...)
 
 #include "idt.h"
 #include "screen.h"
@@ -19,64 +7,32 @@
 static IDTEntry idt[256];
 static IDTPtr idt_ptr;
 
-// =====================================================================
-// Declaraciones externas de los stubs en isr.asm
-// =====================================================================
-extern "C" void isr_0();
-extern "C" void isr_1();
-extern "C" void isr_2();
-extern "C" void isr_3();
-extern "C" void isr_4();
-extern "C" void isr_5();
-extern "C" void isr_6();
-extern "C" void isr_7();
-extern "C" void isr_8();
-extern "C" void isr_9();
-extern "C" void isr_10();
-extern "C" void isr_11();
-extern "C" void isr_12();
-extern "C" void isr_13();
-extern "C" void isr_14();
-extern "C" void isr_15();
-extern "C" void isr_16();
-extern "C" void isr_17();
-extern "C" void isr_18();
-extern "C" void isr_19();
-extern "C" void isr_20();
-extern "C" void isr_21();
-extern "C" void isr_22();
-extern "C" void isr_23();
-extern "C" void isr_24();
-extern "C" void isr_25();
-extern "C" void isr_26();
-extern "C" void isr_27();
-extern "C" void isr_28();
-extern "C" void isr_29();
-extern "C" void isr_30();
-extern "C" void isr_31();
+extern "C" void isr_0();  extern "C" void isr_1();
+extern "C" void isr_2();  extern "C" void isr_3();
+extern "C" void isr_4();  extern "C" void isr_5();
+extern "C" void isr_6();  extern "C" void isr_7();
+extern "C" void isr_8();  extern "C" void isr_9();
+extern "C" void isr_10(); extern "C" void isr_11();
+extern "C" void isr_12(); extern "C" void isr_13();
+extern "C" void isr_14(); extern "C" void isr_15();
+extern "C" void isr_16(); extern "C" void isr_17();
+extern "C" void isr_18(); extern "C" void isr_19();
+extern "C" void isr_20(); extern "C" void isr_21();
+extern "C" void isr_22(); extern "C" void isr_23();
+extern "C" void isr_24(); extern "C" void isr_25();
+extern "C" void isr_26(); extern "C" void isr_27();
+extern "C" void isr_28(); extern "C" void isr_29();
+extern "C" void isr_30(); extern "C" void isr_31();
 
-extern "C" void irq_0();
-extern "C" void irq_1();
-extern "C" void irq_2();
-extern "C" void irq_3();
-extern "C" void irq_4();
-extern "C" void irq_5();
-extern "C" void irq_6();
-extern "C" void irq_7();
-extern "C" void irq_8();
-extern "C" void irq_9();
-extern "C" void irq_10();
-extern "C" void irq_11();
-extern "C" void irq_12();
-extern "C" void irq_13();
-extern "C" void irq_14();
-extern "C" void irq_15();
+extern "C" void irq_0();  extern "C" void irq_1();
+extern "C" void irq_2();  extern "C" void irq_3();
+extern "C" void irq_4();  extern "C" void irq_5();
+extern "C" void irq_6();  extern "C" void irq_7();
+extern "C" void irq_8();  extern "C" void irq_9();
+extern "C" void irq_10(); extern "C" void irq_11();
+extern "C" void irq_12(); extern "C" void irq_13();
+extern "C" void irq_14(); extern "C" void irq_15();
 
-// =====================================================================
-// Configurar una entrada de la IDT
-//
-// No-static: syscall.cpp la llama para registrar int 0x80.
-// =====================================================================
 void idt_set_gate(int n, unsigned int base, unsigned short sel, unsigned char flags) {
     idt[n].base_lo = base & 0xFFFF;
     idt[n].base_hi = (base >> 16) & 0xFFFF;
@@ -85,19 +41,16 @@ void idt_set_gate(int n, unsigned int base, unsigned short sel, unsigned char fl
     idt[n].flags = flags;
 }
 
-// =====================================================================
-// Inicializar la IDT
-// =====================================================================
 void idt_init() {
     idt_ptr.limit = sizeof(IDTEntry) * 256 - 1;
     idt_ptr.base = (unsigned int)&idt;
 
-    // --- Rellenar las 256 entradas con isr_0 por defecto ---
+    // Default: isr_0 (DPL=0, 32-bit interrupt gate)
     for (int i = 0; i < 256; i++) {
         idt_set_gate(i, (unsigned int)isr_0, 0x08, 0x8E);
     }
 
-    // --- Excepciones 0-31 (INT 0x00 - 0x1F) ---
+    // Excepciones 0-31
     idt_set_gate(0,  (unsigned int)isr_0,  0x08, 0x8E);
     idt_set_gate(1,  (unsigned int)isr_1,  0x08, 0x8E);
     idt_set_gate(2,  (unsigned int)isr_2,  0x08, 0x8E);
@@ -131,7 +84,7 @@ void idt_init() {
     idt_set_gate(30, (unsigned int)isr_30, 0x08, 0x8E);
     idt_set_gate(31, (unsigned int)isr_31, 0x08, 0x8E);
 
-    // --- IRQs 0-15 (INT 0x20 - 0x2F, tras remapear el PIC) ---
+    // IRQs
     idt_set_gate(32, (unsigned int)irq_0,  0x08, 0x8E);
     idt_set_gate(33, (unsigned int)irq_1,  0x08, 0x8E);
     idt_set_gate(34, (unsigned int)irq_2,  0x08, 0x8E);
@@ -149,6 +102,5 @@ void idt_init() {
     idt_set_gate(46, (unsigned int)irq_14, 0x08, 0x8E);
     idt_set_gate(47, (unsigned int)irq_15, 0x08, 0x8E);
 
-    // --- Cargar la IDT ---
     asm volatile("lidt %0" : : "m"(idt_ptr));
 }

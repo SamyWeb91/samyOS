@@ -13,29 +13,42 @@ enter_user_mode:
 
     cli
 
-    ; Frame del iretd (solo esto)
-    push 0x23               ; SS
+    ; Frame del iretd
+    push 0x23               ; SS (DPL=3)
     push edx                ; ESP
-    push 0x202              ; EFLAGS (IF = 1)
-    push 0x1B               ; CS
+    push 0x202              ; EFLAGS (IF=1, bit1 reservado=1)
+    push 0x1B               ; CS (DPL=3)
     push eax                ; EIP
 
-    ; NO tocamos DS, ES, FS, GS aquí.
+    ; ⚠️ CRÍTICO: recargar DS/ES/FS/GS con el selector de usuario.
+    ; Es legal hacerlo desde Ring 0 porque DPL(0x23)=3 >= max(CPL=0, RPL=3).
+    mov ax, 0x23
+    mov ds, ax
+    mov es, ax
+    mov fs, ax
+    mov gs, ax
+
     iretd
 
 ; void user_mode_entry(uint32_t eip, uint32_t esp, uint32_t eflags, uint32_t cs, uint32_t ss);
-; Esta funcion la usa el planificador
 user_mode_entry:
-    mov eax, [esp + 4]
-    mov edx, [esp + 8]
-    mov ecx, [esp + 12]
-    mov ebx, [esp + 16]
-    mov esi, [esp + 20]
+    mov eax, [esp + 4]      ; eip
+    mov edx, [esp + 8]      ; esp
+    mov ecx, [esp + 12]     ; eflags
+    mov ebx, [esp + 16]     ; cs
+    mov esi, [esp + 20]     ; ss
 
     cli
-    push esi
-    push edx
-    push ecx
-    push ebx
-    push eax
+    push esi                ; SS
+    push edx                ; ESP
+    push ecx                ; EFLAGS
+    push ebx                ; CS
+    push eax                ; EIP
+
+    mov ax, si              ; si = ss = 0x23
+    mov ds, ax
+    mov es, ax
+    mov fs, ax
+    mov gs, ax
+
     iretd

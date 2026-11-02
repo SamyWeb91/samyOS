@@ -1,0 +1,501 @@
+************
+ARCHIVO: paging.cpp
+************
+// Copyright (C) 2026 Samuel Tamayo Infante
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+#include "paging.h"
+#include "screen.h"
+
+static unsigned int page_directory[1024] __attribute__((aligned(4096)));
+static unsigned int page_table_0[1024]   __attribute__((aligned(4096)));
+
+#define PT_POOL_SIZE 64   // 32 PTs = 128 MB mapeables
+static unsigned int pt_pool[PT_POOL_SIZE][1024] __attribute__((aligned(4096)));
+static int pt_pool_next = 0;
+
+extern "C" void paging_enable_asm(unsigned int pd_phys);
+
+extern "C" void paging_init() {
+    for (int i = 0; i < 1024; i++) {
+        page_directory[i] = 0;
+        page_table_0[i]   = 0;
+    }
+
+    // Mapear los primeros 128 MB de RAM linealmente (identidad).
+    int PTs_needed = 32;   // 32 PTs * 4 MB = 128 MB
+    if (PTs_needed > PT_POOL_SIZE) PTs_needed = PT_POOL_SIZE;
+
+    for (int pt_i = 0; pt_i < PTs_needed; pt_i++) {
+        unsigned int *pt;
+        if (pt_i == 0) {
+            pt = page_table_0;
+        } else {
+            pt = pt_pool[pt_i];
+        }
+
+        unsigned int base_phys = pt_i * 0x400000;
+
+        for (int i = 0; i < 1024; i++) {
+            pt[i] = (base_phys + i * 0x1000) | PTE_PRESENT | PTE_RW;
+        }
+
+        page_directory[pt_i] = ((unsigned int)pt) | PTE_PRESENT | PTE_RW;
+    }
+
+    kprintf("paging: %d MB mapeados (0x0 - 0x%x)\n",
+            PTs_needed * 4, PTs_needed * 0x400000);
+}
+
+extern "C" void paging_enable_now() {
+    paging_enable_asm((unsigned int)page_directory);
+}
+
+extern "C" void paging_map(unsigned int virt, unsigned int phys, unsigned int flags) {
+    unsigned int pd_index = virt >> 22;
+    unsigned int pt_index = (virt >> 12) & 0x3FF;
+
+    if (!(page_directory[pd_index] & PTE_PRESENT)) {
+        if (pt_pool_next >= PT_POOL_SIZE) return;
+
+        unsigned int *new_pt = pt_pool[pt_pool_next++];
+        for (int i = 0; i < 1024; i++) new_pt[i] = 0;
+
+        unsigned int pde_flags = PTE_PRESENT | PTE_RW;
+        if (flags & PTE_USER) pde_flags |= PTE_USER;
+        
+        page_directory[pd_index] = ((unsigned int)new_pt) | pde_flags;
+    } else {
+        // Si el PDE ya existía (como los primeros 128 MB), le añadimos PTE_USER
+        if ((flags & PTE_USER) && !(page_directory[pd_index] & PTE_USER)) {
+            page_directory[pd_index] |= PTE_USER;
+        }
+    }
+
+    unsigned int *pt = (unsigned int*)(page_directory[pd_index] & 0xFFFFF000);
+    
+    // FIX CRÍTICO: Escribir el PTE asegurando que los flags de usuario se mantengan
+    // en el nivel inferior (Page Table). Si no hacemos esto, el iret fallará.
+    unsigned int new_pte = (phys & 0xFFFFF000) | PTE_PRESENT;
+    if (flags & PTE_RW)   new_pte |= PTE_RW;
+    if (flags & PTE_USER) new_pte |= PTE_USER;
+    if (flags & PTE_PAT)  new_pte |= PTE_PAT;
+
+    pt[pt_index] = new_pte;
+
+    asm volatile("invlpg (%0)" : : "r"(virt) : "memory");
+}
+
+extern "C" void paging_map_range(unsigned int virt, unsigned int phys, unsigned int size_kb, unsigned int flags) {
+    for (unsigned int i = 0; i < size_kb; i++) {
+        paging_map(virt + i * 0x1000, phys + i * 0x1000, flags);
+    }
+}
+
+extern "C" unsigned int paging_get_pd_addr()  { return (unsigned int)page_directory; }
+extern "C" unsigned int paging_get_pt0_addr() { return (unsigned int)page_table_0; }
+
+************
+
+************
+ARCHIVO: paging.h
+************
+/*
+ * Copyright (C) 2026 Samuel Tamayo Infante
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+// paging.h
+#pragma once
+
+/* =====================================================================
+ * Flags de PTE (Page Table Entry)
+ * ===================================================================== */
+#define PTE_PRESENT  0x001   /* Page present */
+#define PTE_RW       0x002   /* Read/Write */
+#define PTE_USER     0x004   /* Accesible desde ring 3 */
+#define PTE_PWT      0x008   /* Page Write-Through */
+#define PTE_PCD      0x010   /* Page Cache Disable */
+#define PTE_PAT      0x080   /* Page Attribute Table (bit 7 en PTE) */
+#define PTE_WC       (PTE_PWT | PTE_PCD)   /* Write-Combining (sin PAT) */
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+void paging_init();
+void paging_enable_now();
+
+void paging_map(unsigned int virt, unsigned int phys, unsigned int flags);
+void paging_map_range(unsigned int virt, unsigned int phys, unsigned int size_kb, unsigned int flags);
+
+unsigned int paging_get_pd_addr();
+unsigned int paging_get_pt0_addr();
+
+#ifdef __cplusplus
+}
+#endif
+
+************
+
+************
+ARCHIVO: tss.cpp
+************
+// Copyright (C) 2026 Samuel Tamayo Infante
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+#include "tss.h"
+#include "gdt.h"
+#include "screen.h"
+
+// Alineada a 4 bytes (importante en hardware real)
+static TSS tss __attribute__((aligned(4)));
+
+extern "C" void tss_flush(void);
+
+extern "C" void tss_init(void) {
+    // Limpiar toda la estructura
+    uint8_t *p = (uint8_t*)&tss;
+    for (unsigned int i = 0; i < sizeof(TSS); i++) p[i] = 0;
+
+    tss.ss0 = 0x10;                 // Data segment del kernel
+    tss.esp0 = 0;                   // Se rellena justo antes de saltar a Ring 3
+    tss.iomap_base = sizeof(TSS);   // No hay I/O bitmap
+
+    // Registrar en la GDT (índice 5 → selector 0x28)
+    gdt_set_tss(5, (uint32_t)&tss, sizeof(TSS) - 1);
+
+    tss_flush();
+
+    kprintf("TSS: cargado en 0x28 (base=0x%x, limit=%u, ss0=0x%x)\n",
+            (uint32_t)&tss, sizeof(TSS) - 1, tss.ss0);
+}
+
+extern "C" void tss_set_kernel_stack(uint32_t esp0) {
+    // Alinear a 16 bytes por si acaso
+    tss.esp0 = esp0 & ~0xFu;
+}
+
+************
+
+************
+ARCHIVO: tss.h
+************
+/*
+ * Copyright (C) 2026 Samuel Tamayo Infante
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+#pragma once
+
+#include <stdint.h>
+
+struct TSS {
+    uint32_t prev_tss;
+    uint32_t esp0;
+    uint32_t ss0;
+    uint32_t esp1, ss1;
+    uint32_t esp2, ss2;
+    uint32_t cr3;
+    uint32_t eip, eflags;
+    uint32_t eax, ecx, edx, ebx;
+    uint32_t esp, ebp, esi, edi;
+    uint32_t es, cs, ss, ds, fs, gs;
+    uint32_t ldt;
+    uint16_t trap;
+    uint16_t iomap_base;
+} __attribute__((packed));
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+void tss_init(void);
+void tss_set_kernel_stack(uint32_t esp0);
+uint32_t tss_get_esp0(void);
+uint32_t tss_get_ss0(void);
+uint32_t tss_get_base(void);
+uint32_t tss_get_limit(void);
+
+#ifdef __cplusplus
+}
+#endif
+
+************
+
+************
+ARCHIVO: idt.cpp
+************
+// Copyright (C) 2026 Samuel Tamayo Infante
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+#include "idt.h"
+#include "screen.h"
+
+static IDTEntry idt[256];
+static IDTPtr idt_ptr;
+
+// =====================================================================
+// Declaraciones externas de los stubs en isr.asm
+// =====================================================================
+extern "C" void isr_0();
+extern "C" void isr_1();
+extern "C" void isr_2();
+extern "C" void isr_3();
+extern "C" void isr_4();
+extern "C" void isr_5();
+extern "C" void isr_6();
+extern "C" void isr_7();
+extern "C" void isr_8();
+extern "C" void isr_9();
+extern "C" void isr_10();
+extern "C" void isr_11();
+extern "C" void isr_12();
+extern "C" void isr_13();
+extern "C" void isr_14();
+extern "C" void isr_15();
+extern "C" void isr_16();
+extern "C" void isr_17();
+extern "C" void isr_18();
+extern "C" void isr_19();
+extern "C" void isr_20();
+extern "C" void isr_21();
+extern "C" void isr_22();
+extern "C" void isr_23();
+extern "C" void isr_24();
+extern "C" void isr_25();
+extern "C" void isr_26();
+extern "C" void isr_27();
+extern "C" void isr_28();
+extern "C" void isr_29();
+extern "C" void isr_30();
+extern "C" void isr_31();
+
+extern "C" void irq_0();
+extern "C" void irq_1();
+extern "C" void irq_2();
+extern "C" void irq_3();
+extern "C" void irq_4();
+extern "C" void irq_5();
+extern "C" void irq_6();
+extern "C" void irq_7();
+extern "C" void irq_8();
+extern "C" void irq_9();
+extern "C" void irq_10();
+extern "C" void irq_11();
+extern "C" void irq_12();
+extern "C" void irq_13();
+extern "C" void irq_14();
+extern "C" void irq_15();
+
+// =====================================================================
+// Configurar una entrada de la IDT
+//
+// No-static: syscall.cpp la llama para registrar int 0x80.
+// =====================================================================
+void idt_set_gate(int n, unsigned int base, unsigned short sel, unsigned char flags) {
+    idt[n].base_lo = base & 0xFFFF;
+    idt[n].base_hi = (base >> 16) & 0xFFFF;
+    idt[n].sel = sel;
+    idt[n].always0 = 0;
+    idt[n].flags = flags;
+}
+
+// =====================================================================
+// Inicializar la IDT
+// =====================================================================
+void idt_init() {
+    idt_ptr.limit = sizeof(IDTEntry) * 256 - 1;
+    idt_ptr.base = (unsigned int)&idt;
+
+    // --- Rellenar las 256 entradas con isr_0 por defecto ---
+    for (int i = 0; i < 256; i++) {
+        idt_set_gate(i, (unsigned int)isr_0, 0x08, 0x8E);
+    }
+
+    // --- Excepciones 0-31 (INT 0x00 - 0x1F) ---
+    idt_set_gate(0,  (unsigned int)isr_0,  0x08, 0x8E);
+    idt_set_gate(1,  (unsigned int)isr_1,  0x08, 0x8E);
+    idt_set_gate(2,  (unsigned int)isr_2,  0x08, 0x8E);
+    idt_set_gate(3,  (unsigned int)isr_3,  0x08, 0x8E);
+    idt_set_gate(4,  (unsigned int)isr_4,  0x08, 0x8E);
+    idt_set_gate(5,  (unsigned int)isr_5,  0x08, 0x8E);
+    idt_set_gate(6,  (unsigned int)isr_6,  0x08, 0x8E);
+    idt_set_gate(7,  (unsigned int)isr_7,  0x08, 0x8E);
+    idt_set_gate(8,  (unsigned int)isr_8,  0x08, 0x8E);
+    idt_set_gate(9,  (unsigned int)isr_9,  0x08, 0x8E);
+    idt_set_gate(10, (unsigned int)isr_10, 0x08, 0x8E);
+    idt_set_gate(11, (unsigned int)isr_11, 0x08, 0x8E);
+    idt_set_gate(12, (unsigned int)isr_12, 0x08, 0x8E);
+    idt_set_gate(13, (unsigned int)isr_13, 0x08, 0x8E);
+    idt_set_gate(14, (unsigned int)isr_14, 0x08, 0x8E);
+    idt_set_gate(15, (unsigned int)isr_15, 0x08, 0x8E);
+    idt_set_gate(16, (unsigned int)isr_16, 0x08, 0x8E);
+    idt_set_gate(17, (unsigned int)isr_17, 0x08, 0x8E);
+    idt_set_gate(18, (unsigned int)isr_18, 0x08, 0x8E);
+    idt_set_gate(19, (unsigned int)isr_19, 0x08, 0x8E);
+    idt_set_gate(20, (unsigned int)isr_20, 0x08, 0x8E);
+    idt_set_gate(21, (unsigned int)isr_21, 0x08, 0x8E);
+    idt_set_gate(22, (unsigned int)isr_22, 0x08, 0x8E);
+    idt_set_gate(23, (unsigned int)isr_23, 0x08, 0x8E);
+    idt_set_gate(24, (unsigned int)isr_24, 0x08, 0x8E);
+    idt_set_gate(25, (unsigned int)isr_25, 0x08, 0x8E);
+    idt_set_gate(26, (unsigned int)isr_26, 0x08, 0x8E);
+    idt_set_gate(27, (unsigned int)isr_27, 0x08, 0x8E);
+    idt_set_gate(28, (unsigned int)isr_28, 0x08, 0x8E);
+    idt_set_gate(29, (unsigned int)isr_29, 0x08, 0x8E);
+    idt_set_gate(30, (unsigned int)isr_30, 0x08, 0x8E);
+    idt_set_gate(31, (unsigned int)isr_31, 0x08, 0x8E);
+
+    // --- IRQs 0-15 (INT 0x20 - 0x2F, tras remapear el PIC) ---
+    idt_set_gate(32, (unsigned int)irq_0,  0x08, 0x8E);
+    idt_set_gate(33, (unsigned int)irq_1,  0x08, 0x8E);
+    idt_set_gate(34, (unsigned int)irq_2,  0x08, 0x8E);
+    idt_set_gate(35, (unsigned int)irq_3,  0x08, 0x8E);
+    idt_set_gate(36, (unsigned int)irq_4,  0x08, 0x8E);
+    idt_set_gate(37, (unsigned int)irq_5,  0x08, 0x8E);
+    idt_set_gate(38, (unsigned int)irq_6,  0x08, 0x8E);
+    idt_set_gate(39, (unsigned int)irq_7,  0x08, 0x8E);
+    idt_set_gate(40, (unsigned int)irq_8,  0x08, 0x8E);
+    idt_set_gate(41, (unsigned int)irq_9,  0x08, 0x8E);
+    idt_set_gate(42, (unsigned int)irq_10, 0x08, 0x8E);
+    idt_set_gate(43, (unsigned int)irq_11, 0x08, 0x8E);
+    idt_set_gate(44, (unsigned int)irq_12, 0x08, 0x8E);
+    idt_set_gate(45, (unsigned int)irq_13, 0x08, 0x8E);
+    idt_set_gate(46, (unsigned int)irq_14, 0x08, 0x8E);
+    idt_set_gate(47, (unsigned int)irq_15, 0x08, 0x8E);
+
+    // --- Cargar la IDT ---
+    asm volatile("lidt %0" : : "m"(idt_ptr));
+}
+
+************
+
+************
+ARCHIVO: isr.cpp
+************
+// Copyright (C) 2026 Samuel Tamayo Infante
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+#include "isr.h"
+#include "screen.h"
+#include "pic.h"
+#include "pit.h"
+#include "keyboard.h"
+#include "thread.h"
+#include "mouse.h"
+
+extern "C" void isr_handler(Regs *r) {
+    // Excepciones (0-31)
+    if (r->int_no < 32) {
+        unsigned int cr2 = 0;
+        // Si es un Page Fault (14), leer CR2 para saber qué dirección falló
+        if (r->int_no == 14) {
+            asm volatile("mov %%cr2, %0" : "=r"(cr2));
+        }
+
+        kprintf("\nEXC %d (err=%x) EIP=%x CR2=%x\n",
+                r->int_no, r->err_code, r->eip, cr2);
+        
+        // Bucle infinito seguro: cli (desactiva interrupciones) + hlt (duerme la CPU)
+        while (1) {
+            asm volatile("cli; hlt");
+        }
+    }
+
+    // IRQs (32-47)
+    if (r->int_no >= 32 && r->int_no <= 47) {
+        unsigned int irq = r->int_no - 32;
+
+        if (irq == 0) {
+            pit_tick();
+            pic_send_eoi(irq);
+            schedule();
+            return;
+        }
+
+        if (irq == 1) {
+            keyboard_handler();
+        }
+        else if (irq == 12) {
+            mouse_handler();
+        }
+
+        pic_send_eoi(irq);
+    }
+}
+
+************
+
