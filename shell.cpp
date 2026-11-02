@@ -24,8 +24,8 @@
 #include "disk.h"
 #include "fat32.h"
 
-/* Prueba aislada de ring 3 (ring3_test.cpp) */
-extern "C" void ring3_test_run(void);
+/* Cargador universal de programas en Ring 3 */
+extern "C" int ring3_execute(const char *filename);
 
 /* =====================================================================
  * Forward declarations
@@ -37,6 +37,7 @@ void print_uint(int wid, unsigned int v);
 static int  str_eq(const char *a, const char *b);
 static int  str_starts_with(const char *str, const char *prefix);
 static unsigned int str_len(const char *s);
+static void to_uppercase(char *str);
 
 /* =====================================================================
  * Linea de entrada por terminal
@@ -75,6 +76,15 @@ static unsigned int str_len(const char *s) {
     unsigned int n = 0;
     while (s[n]) n++;
     return n;
+}
+
+static void to_uppercase(char *str) {
+    while (*str) {
+        if (*str >= 'a' && *str <= 'z') {
+            *str = *str - 'a' + 'A';
+        }
+        str++;
+    }
 }
 
 /* =====================================================================
@@ -140,7 +150,7 @@ static void cmd_help(int wid) {
     term_println(wid, "  disk       - estado del disco AHCI");
     term_println(wid, "  partitions - lista particiones");
     term_println(wid, "  hex <lba>  - volcar sector");
-    term_println(wid, "  ring3      - cargar TEST.BIN del disco y ejecutar en Ring 3");
+    term_println(wid, "  run <n>    - ejecutar programa ELF en Ring 3");
     term_println(wid, "  close      - cerrar esta ventana");
 }
 
@@ -156,15 +166,6 @@ static void cmd_date(int wid) {
     buf[16] = 0;
     term_println(wid, buf);
 }
-
-/* Comentado porque folder ya no se usa
-static void cmd_files(int wid) {
-    if (folder_open(120, 100, 400, 320) < 0)
-        term_println(wid, "files: no se pudo abrir");
-    else
-        term_println(wid, "files: abriendo gestor");
-}
-*/
 
 static void cmd_fatls(int wid, const char *path) {
     if (!fat32_is_mounted()) {
@@ -230,10 +231,37 @@ static void cmd_execute(int wid, ShellTerm *t, const char *cmd) {
     else if (str_eq(cmd, "help"))         cmd_help(wid);
     else if (str_eq(cmd, "clear"))        win_sys_clear(wid);
     else if (str_eq(cmd, "date"))         cmd_date(wid);
-    // else if (str_eq(cmd, "files"))        cmd_files(wid); // Comentado
 
-    /* Prueba de ring 3 */
-    else if (str_eq(cmd, "ring3"))        ring3_test_run();
+    /* Ejecutar programa de usuario (Ring 3) */
+    else if (str_starts_with(cmd, "run ")) {
+        char filename[TERM_LINE_MAX];
+        const char *arg = cmd + 4; // Saltamos "run "
+        
+        // Copiar argumento y convertir a mayúsculas para FAT32
+        int i = 0;
+        while (arg[i] && i < TERM_LINE_MAX - 1) {
+            filename[i] = arg[i];
+            i++;
+        }
+        filename[i] = 0;
+        to_uppercase(filename);
+
+        if (i == 0) {
+            term_println(wid, "uso: run <archivo.elf>");
+        } else {
+            term_print(wid, "Ejecutando: ");
+            term_println(wid, filename);
+            
+            // Llamar al cargador universal
+            int res = ring3_execute(filename);
+            
+            if (res == 0) {
+                term_println(wid, ">> Programa finalizado.");
+            } else {
+                term_println(wid, ">> Error al ejecutar programa.");
+            }
+        }
+    }
 
     else if (str_eq(cmd, "close")) {
         composer_dirty_window(wid);
@@ -291,13 +319,6 @@ extern "C" int shell_new_terminal(int x, int y, int w, int h, const char *title)
 
 extern "C" void shell_handle_key(int wid, char c) {
     if (wid < 0) return;
-
-    /* Comentado porque folder ya no se usa
-    if (folder_is_folder(wid)) {
-        folder_handle_key(wid, c);
-        return;
-    }
-    */
 
     ShellTerm *t = 0;
     for (int i = 0; i < SHELL_MAX_TERMS; i++) {
