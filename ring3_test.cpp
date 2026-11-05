@@ -5,9 +5,8 @@
 #include "fat32.h"
 #include "ahci.h"
 #include "process.h"
-#include "thread.h"   // NUEVO: Necesario para crear el hilo puente
+#include "thread.h"
 
-// Tamaño de la pila de usuario
 #define USER_STACK_SIZE     0x4000u
 
 static uint8_t file_buffer[65536];
@@ -16,6 +15,7 @@ static uint8_t ring3_kernel_stack[8192] __attribute__((aligned(16)));
 // Variables globales para pasar los datos al hilo puente
 static uint32_t global_entry = 0;
 static uint32_t global_stack = 0;
+static int global_pid = -1; // NUEVO: Para liberar la memoria al terminar
 
 // Estructuras ELF
 typedef struct {
@@ -82,11 +82,10 @@ static void find_file_cb(const char *name, uint32_t size, uint8_t attr, uint32_t
 // =====================================================================
 static void jump_thread_func(void) {
     kprintf("jump_thread: Saltando a Ring 3 (Entry=0x%x)\n", global_entry);
-    
-    // Hacemos el salto usando la función original de ensamblador
     enter_user_mode(global_entry, global_stack);
     
-    // Si el programa de usuario termina y vuelve aquí, matamos el hilo
+    // Si el hilo regresa (porque el usuario hizo SYS_EXIT), liberamos la memoria
+    process_free(global_pid);
     thread_exit();
 }
 
@@ -99,17 +98,15 @@ extern "C" int ring3_execute(const char *filename) {
     uint32_t base_addr = 0;
     uint32_t stack_top = 0;
     
-    // Pedir hueco al gestor de procesos (process.cpp)
+    // 1. Pedir hueco (devuelve base 0x08000000, 0x09000000, etc.)
     int pid = process_alloc(filename, &base_addr, &stack_top);
     if (pid < 0) return -1;
 
-    // Asegurar FAT32
     if (!fat32_is_mounted()) {
         uint32_t lba = fat32_scan();
         if (!lba || !fat32_mount(lba)) { process_free(pid); return -1; }
     }
 
-    // Buscar el archivo
     found_cluster = 0;
     found_size = 0;
     target_filename = filename;
@@ -128,7 +125,6 @@ extern "C" int ring3_execute(const char *filename) {
         return -1;
     }
 
-    // Leer el archivo a memoria temporal
     uint32_t cluster = found_cluster;
     uint32_t copied = 0;
     uint8_t *out = file_buffer;
@@ -141,7 +137,6 @@ extern "C" int ring3_execute(const char *filename) {
         cluster = fat32_next_cluster(cluster);
     }
 
-    // Validar ELF
     Elf32_Ehdr *ehdr = (Elf32_Ehdr *)file_buffer;
     if (ehdr->e_ident[0] != 0x7F || ehdr->e_ident[1] != 'E' ||
         ehdr->e_ident[2] != 'L' || ehdr->e_ident[3] != 'F') {
@@ -150,30 +145,34 @@ extern "C" int ring3_execute(const char *filename) {
         return -1;
     }
 
-    // Mapear pila de usuario (dentro del bloque asignado por process_alloc)
-    uint32_t user_stack_base = base_addr + 0x10000; 
+    // 2. Mapear pila de usuario
+    uint32_t user_stack_base = base_addr + 0x10000;
     for (uint32_t off = 0; off < USER_STACK_SIZE; off += 0x1000) {
         paging_map(user_stack_base + off, user_stack_base + off, PTE_PRESENT | PTE_RW | PTE_USER);
     }
 
-    // Mapear el framebuffer
+    // 3. Mapear framebuffer
     uint32_t fb_addr = *(uint32_t*)0x6004;
     for (uint32_t off = 0; off < 1024 * 768 * 4; off += 0x1000) {
         paging_map(fb_addr + off, fb_addr + off, PTE_PRESENT | PTE_RW | PTE_USER | PTE_PAT);
     }
 
-    // Cargar segmentos PT_LOAD (Usamos direcciones absolutas, sin sumar base_addr)
+    // 4. Cargar segmentos PT_LOAD sumando la base_addr
     Elf32_Phdr *phdr = (Elf32_Phdr *)(file_buffer + ehdr->e_phoff);
     for (int i = 0; i < ehdr->e_phnum; i++) {
         if (phdr[i].p_type == PT_LOAD) {
-            uint32_t vaddr_start = phdr[i].p_vaddr & ~0xFFFu;
-            uint32_t vaddr_end   = (phdr[i].p_vaddr + phdr[i].p_memsz + 0xFFF) & ~0xFFFu;
+            // El ELF tiene direcciones virtuales relativas (ej. 0x0)
+            uint32_t elf_vaddr = phdr[i].p_vaddr;
+            
+            // Mapeamos y copiamos en base_addr + elf_vaddr
+            uint32_t vaddr_start = (base_addr + elf_vaddr) & ~0xFFFu;
+            uint32_t vaddr_end   = (base_addr + elf_vaddr + phdr[i].p_memsz + 0xFFF) & ~0xFFFu;
 
             for (uint32_t addr = vaddr_start; addr < vaddr_end; addr += 0x1000) {
                 paging_map(addr, addr, PTE_PRESENT | PTE_RW | PTE_USER);
             }
 
-            uint8_t *dest = (uint8_t *)(phdr[i].p_vaddr);
+            uint8_t *dest = (uint8_t *)(base_addr + elf_vaddr);
             uint8_t *src  = file_buffer + phdr[i].p_offset;
 
             for (uint32_t j = 0; j < phdr[i].p_filesz; j++) dest[j] = src[j];
@@ -181,21 +180,19 @@ extern "C" int ring3_execute(const char *filename) {
         }
     }
 
-    // Flush TLB
     asm volatile("mov %%cr3, %%eax; mov %%eax, %%cr3" ::: "eax", "memory");
 
-    // Configurar pila del kernel para el TSS
     uint32_t esp0 = (uint32_t)(ring3_kernel_stack + sizeof(ring3_kernel_stack));
     esp0 &= ~0xFu;
     tss_set_kernel_stack(esp0);
 
-    // Preparar las variables globales para el hilo puente
-    global_entry = ehdr->e_entry;
+    // 5. Configurar variables globales para el hilo
+    global_entry = base_addr + ehdr->e_entry; // Sumamos la base al entry
     global_stack = user_stack_base + USER_STACK_SIZE - 16;
+    global_pid = pid; // Guardamos el PID para liberar memoria después
 
-    kprintf("ring3: Creando hilo puente en Ring 0...\n");
-    
-    // Crear el hilo de KERNEL que hará el salto
+    kprintf("ring3: Entry final = 0x%x | Stack = 0x%x\n", global_entry, global_stack);
+
     int tid = thread_create(filename, jump_thread_func);
     if (tid < 0) {
         kprintf("ring3: Error al crear hilo (tabla llena)\n");
