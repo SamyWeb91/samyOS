@@ -1,0 +1,546 @@
+************
+ARCHIVO: thread.cpp
+************
+// Copyright (C) 2026 Samuel Tamayo Infante
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+#include "thread.h"
+#include "screen.h"
+
+extern "C" void context_switch(uint32_t *old_esp, uint32_t new_esp);
+extern "C" void thread_entry_trampoline(void);
+extern "C" void user_mode_entry(uint32_t eip, uint32_t esp, uint32_t eflags, uint32_t cs, uint32_t ss);
+
+static Thread threads[THREAD_MAX];
+static int    thread_count = 0;
+static int    current = 0;
+static volatile int in_schedule = 0;
+
+static uint8_t thread_stacks[THREAD_MAX][THREAD_STACK] __attribute__((aligned(16)));
+static void (*thread_entries[THREAD_MAX])(void);
+static unsigned int thread_ticks[THREAD_MAX];
+
+extern "C" void thread_trampoline_c(void) {
+    int id = current;
+    void (*fn)(void) = thread_entries[id];
+    thread_entries[id] = 0;
+    if (fn) fn();
+    thread_exit();
+    while (1) {}
+}
+
+extern "C" void thread_init(void) {
+    for (int i = 0; i < THREAD_MAX; i++) {
+        threads[i].esp = 0;
+        threads[i].state = TH_ZOMBIE;
+        threads[i].name[0] = 0;
+        thread_entries[i] = 0;
+        thread_ticks[i] = 0;
+        threads[i].user_eip = 0;
+    }
+
+    current = 0;
+    threads[0].state = TH_RUNNING;
+    threads[0].id = 0;
+    threads[0].priority = 1;
+    
+    uint32_t kmain_esp;
+    asm volatile("mov %%esp, %0" : "=r"(kmain_esp));
+    threads[0].esp = kmain_esp;
+    
+    const char *n = "kmain";
+    int k = 0; while (n[k] && k < THREAD_NAME_MAX - 1) { threads[0].name[k] = n[k]; k++; }
+    threads[0].name[k] = 0;
+    thread_count = 1;
+
+    kprintf("Threads: init (%d max) kmain esp=%x\n", THREAD_MAX, kmain_esp);
+}
+
+extern "C" int thread_create(const char *name, void (*entry)(void)) {
+    if (thread_count >= THREAD_MAX || !entry) return -1;
+    int idx = -1;
+    for (int i = 1; i < THREAD_MAX; i++) {
+        if (threads[i].state == TH_ZOMBIE && threads[i].name[0] == 0) { idx = i; break; }
+    }
+    if (idx < 0) return -1;
+
+    uint8_t *stack = thread_stacks[idx];
+    int k = 0; while (name[k] && k < THREAD_NAME_MAX - 1) { threads[idx].name[k] = name[k]; k++; }
+    threads[idx].name[k] = 0;
+    
+    threads[idx].id = idx;
+    threads[idx].stack_base = (uint32_t)stack;
+    threads[idx].stack_size = THREAD_STACK;
+    threads[idx].state = TH_READY;
+    threads[idx].priority = 1;
+    thread_entries[idx] = entry;
+    thread_ticks[idx] = 0;
+    threads[idx].user_eip = 0; // No es de usuario
+
+    uint32_t *sp = (uint32_t *)(stack + THREAD_STACK);
+    *--sp = (uint32_t)thread_entry_trampoline;
+    *--sp = 0x202;
+    *--sp = 0; *--sp = 0; *--sp = 0; *--sp = 0; *--sp = 0; *--sp = 0; *--sp = 0; *--sp = 0;
+
+    threads[idx].esp = (uint32_t)sp;
+    thread_count++;
+    return idx;
+}
+
+// =====================================================================
+// Crear hilo de Usuario (Ring 3)
+// =====================================================================
+extern "C" int thread_create_user(const char *name, uint32_t eip, uint32_t esp) {
+    if (thread_count >= THREAD_MAX) return -1;
+    int idx = -1;
+    for (int i = 1; i < THREAD_MAX; i++) {
+        if (threads[i].state == TH_ZOMBIE && threads[i].name[0] == 0) { idx = i; break; }
+    }
+    if (idx < 0) return -1;
+
+    int k = 0; while (name[k] && k < THREAD_NAME_MAX - 1) { threads[idx].name[k] = name[k]; k++; }
+    threads[idx].name[k] = 0;
+    
+    threads[idx].id = idx;
+    threads[idx].state = TH_USER;
+    threads[idx].priority = 1;
+    thread_ticks[idx] = 0;
+    
+    // Contexto de usuario
+    threads[idx].user_eip = eip;
+    threads[idx].user_esp = esp;
+    threads[idx].user_eflags = 0x202;
+    threads[idx].user_cs = 0x1B;
+    threads[idx].user_ss = 0x23;
+
+    // Pila del kernel (para cuando entre por interrupciones/syscalls)
+    uint8_t *stack = thread_stacks[idx];
+    uint32_t *sp = (uint32_t *)(stack + THREAD_STACK);
+    *--sp = 0; // ret dummy (no se usa en user_mode_entry)
+    *--sp = 0x202; 
+    *--sp = 0; *--sp = 0; *--sp = 0; *--sp = 0; *--sp = 0; *--sp = 0; *--sp = 0; *--sp = 0;
+    threads[idx].esp = (uint32_t)sp;
+    
+    thread_count++;
+    kprintf("Threads: USER '%s' (id=%d) eip=%x esp=%x\n", name, idx, eip, esp);
+    return idx;
+}
+
+extern "C" void schedule(void) {
+    uint32_t flags;
+    asm volatile("pushf; pop %0; cli" : "=r"(flags));
+
+    if (in_schedule) {
+        if (flags & 0x200) asm volatile("sti");
+        return;
+    }
+    in_schedule = 1;
+
+    thread_ticks[current]++;
+    if (thread_count <= 1) {
+        in_schedule = 0;
+        if (flags & 0x200) asm volatile("sti");
+        return;
+    }
+
+    int prev = current;
+    int next = -1;
+
+    // Buscar el siguiente hilo (READY, RUNNING o USER)
+    for (int i = 1; i <= THREAD_MAX; i++) {
+        int c = (prev + i) % THREAD_MAX;
+        if ((threads[c].state == TH_READY || threads[c].state == TH_USER) && threads[c].esp != 0) {
+            next = c;
+            break;
+        }
+    }
+
+    if (next < 0 || next == prev) {
+        in_schedule = 0;
+        if (flags & 0x200) asm volatile("sti");
+        return;
+    }
+
+    if (threads[prev].state == TH_RUNNING) threads[prev].state = TH_READY;
+    if (threads[next].state == TH_READY || threads[next].state == TH_USER) threads[next].state = TH_RUNNING;
+    
+    int was_user = threads[next].user_eip != 0;
+
+    current = next;
+    in_schedule = 0;
+
+    if (was_user) {
+        // SALTO A RING 3 (iretd)
+        user_mode_entry(threads[next].user_eip, threads[next].user_esp, 
+                        threads[next].user_eflags, threads[next].user_cs, threads[next].user_ss);
+    } else {
+        // CAMBIO DE CONTEXTO EN RING 0 (ret)
+        context_switch(&threads[prev].esp, threads[next].esp);
+    }
+    
+    if (flags & 0x200) asm volatile("sti");
+}
+
+extern "C" void thread_yield(void) {
+    schedule();
+}
+
+extern "C" void thread_exit(void) {
+    if (current <= 0) return;
+
+    asm volatile("cli");
+    threads[current].state      = TH_ZOMBIE;
+    threads[current].stack_base = 0;
+    threads[current].esp        = 0;
+    threads[current].stack_size = 0;
+    threads[current].priority   = 0;
+    threads[current].name[0]    = 0;
+    threads[current].user_eip   = 0;
+    thread_entries[current]     = 0;
+    thread_count--;
+    asm volatile("sti");
+
+    schedule();
+    while (1) {}
+}
+
+extern "C" int thread_kill(int id) {
+    if (id <= 0 || id >= THREAD_MAX) return -1;
+    if (threads[id].state == TH_ZOMBIE) return -1;
+
+    asm volatile("cli");
+    threads[id].state      = TH_ZOMBIE;
+    threads[id].stack_base = 0;
+    threads[id].esp        = 0;
+    threads[id].stack_size = 0;
+    threads[id].priority   = 0;
+    threads[id].name[0]    = 0;
+    threads[id].user_eip   = 0;
+    thread_entries[id]     = 0;
+    thread_count--;
+    asm volatile("sti");
+    return 0;
+}
+
+extern "C" int thread_current_id(void) { return current; }
+
+extern "C" void thread_set_priority(int id, int prio) {
+    if (id < 0 || id >= THREAD_MAX) return;
+    if (prio < 0) prio = 0;
+    if (prio > 20) prio = 20;
+    threads[id].priority = prio;
+}
+
+extern "C" void thread_list(void) {
+    const char *state_names[] = { "READY", "RUNNING", "BLOCKED", "ZOMBIE", "USER" };
+    kprintf("PID  NOMBRE      ESTADO    PRIO  TICKS\n");
+    for (int i = 0; i < THREAD_MAX; i++) {
+        if (threads[i].name[0] == 0) continue;
+        if (threads[i].state == TH_ZOMBIE && threads[i].esp == 0) continue;
+
+        kprintf("  %d  %s", i, threads[i].name);
+        int len = 0; while (threads[i].name[len]) len++;
+        for (int j = len; j < 10; j++) screen_putchar(' ');
+
+        kprintf("%s", state_names[threads[i].state]);
+        int sl = 0; while (state_names[threads[i].state][sl]) sl++;
+        for (int j = sl; j < 10; j++) screen_putchar(' ');
+
+        kprintf("%d    %u\n", threads[i].priority, thread_ticks[i]);
+    }
+}
+
+************
+
+************
+ARCHIVO: thread.h
+************
+/*
+ * Copyright (C) 2026 Samuel Tamayo Infante
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+#pragma once
+
+#include <stdint.h>
+
+#define THREAD_MAX       8
+#define THREAD_STACK     4096
+#define THREAD_NAME_MAX  32
+
+// Estados
+#define TH_READY    0
+#define TH_RUNNING  1
+#define TH_BLOCKED  2
+#define TH_ZOMBIE   3
+#define TH_USER     4  // <--- NUEVO: Hilo en Ring 3
+
+struct Thread {
+    uint32_t esp;              // stack pointer guardado (kernel)
+    uint32_t stack_base;       
+    uint32_t stack_size;
+    int      state;
+    int      id;
+    int      priority;
+    char     name[THREAD_NAME_MAX];
+    
+    // NUEVO: Contexto para volver a Ring 3
+    uint32_t user_eip;
+    uint32_t user_esp;
+    uint32_t user_eflags;
+    uint32_t user_cs;
+    uint32_t user_ss;
+};
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+void  thread_init(void);
+int   thread_create(const char *name, void (*entry)(void));
+int   thread_create_user(const char *name, uint32_t eip, uint32_t esp); // <--- NUEVO
+void  thread_yield(void);
+void  thread_exit(void);
+int   thread_kill(int id);
+int   thread_current_id(void);
+void  thread_list(void);
+void  schedule(void);
+
+int   thread_get_count(void);
+int   thread_get_state(int id);
+
+#ifdef __cplusplus
+}
+#endif
+
+************
+
+************
+ARCHIVO: syscall.cpp
+************
+// Copyright (C) 2026 Samuel Tamayo Infante
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+#include "syscall.h"
+#include "screen.h"
+#include "idt.h"
+#include "gfx.h"
+#include "win.h"      // Necesario para win_sys_create
+#include "composer.h" // Necesario para composer_dirty_window
+
+// =====================================================================
+// Números de syscall — DEBEN COINCIDIR con el programa de usuario
+// =====================================================================
+#define SYS_EXIT          0
+#define SYS_WRITE         1
+#define SYS_READ          2
+#define SYS_OPEN          3
+#define SYS_CLOSE         4
+#define SYS_DRAW_RECT     11
+#define SYS_CLEAR         12
+#define SYS_DRAW_TEXT     13
+#define SYS_CREATE_WINDOW 14
+
+extern "C" void isr_128();
+
+// Variable externa del cargador (ring3_test.cpp)
+extern "C" void ring3_volver_kernel(void);
+
+extern "C" void syscall_init(void) {
+    // DPL=3 (0xEE) para que int 0x80 funcione desde Ring 3.
+    idt_set_gate(0x80, (unsigned int)isr_128, 0x08, 0xEE);
+    kprintf("Syscall: int 0x80 registrado (DPL=3)\n");
+}
+
+// =====================================================================
+// Handler de syscalls.
+// Firma de 6 argumentos (eax, ebx, ecx, edx, esi, edi).
+// =====================================================================
+extern "C" void syscall_handler_c(uint32_t eax, uint32_t ebx, uint32_t ecx, uint32_t edx, uint32_t esi, uint32_t edi) {
+    switch (eax) {
+
+    case SYS_EXIT: {
+        kprintf("\n[Syscall: exit(code=%u)]\n", ebx);
+        kprintf("Volviendo a la shell (Longjmp)...\n");
+
+        // Llamar al Longjmp del cargador. 
+        // Esta función no retorna: restaura el ESP y salta de vuelta al kernel.
+        ring3_volver_kernel();
+        
+        // Por si acaso, bucle infinito de seguridad (nunca debería llegar aquí)
+        while (1) { asm volatile("cli; hlt"); }
+        break;
+    }
+
+    case SYS_WRITE: {
+        if (ebx == 1) { // stdout
+            const char *buf = (const char *)ecx;
+            for (uint32_t i = 0; i < edx; i++) {
+                char s[2] = { buf[i], 0 };
+                kprintf("%s", s);
+            }
+        }
+        break;
+    }
+
+    case SYS_DRAW_RECT: {
+        // draw_rect(x=ebx, y=ecx, w=edx, h=esi, color=edi)
+        int x = (int)ebx;
+        int y = (int)ecx;
+        int w = (int)edx;
+        int h = (int)esi;
+        uint32_t color = edi;
+
+        if (w > 0 && w < 2048 && h > 0 && h < 2048) {
+            gfx_fill_rect(x, y, w, h, color);
+        }
+        break;
+    }
+
+    case SYS_DRAW_TEXT: {
+        // draw_text(x=ebx, y=ecx, color=edx, str=esi)
+        int x = (int)ebx;
+        int y = (int)ecx;
+        uint32_t color = edx;
+        const char *str = (const char *)esi;
+
+        // Verificación básica de puntero (debe estar en el rango mapeado de Ring 3)
+        if (str && (uint32_t)str >= 0x08000000 && (uint32_t)str < 0x08400000) {
+            // Tu gfx.h requiere (x, y, string, fg_color, bg_color)
+            // Usaremos 0 como fondo transparente (o negro si tu driver lo requiere)
+            gfx_draw_string(x, y, str, color, 0); 
+        }
+        break;
+    }
+
+    case SYS_CREATE_WINDOW: {
+        // create_window(x=ebx, y=ecx, w=edx, h=esi, title=edi)
+        int x = (int)ebx;
+        int y = (int)ecx;
+        int w = (int)edx;
+        int h = (int)esi;
+        const char *title = (const char *)edi;
+
+        if (title && (uint32_t)title >= 0x08000000 && (uint32_t)title < 0x08400000) {
+            if (w > 0 && w < 1024 && h > 0 && h < 768) {
+                // Crea una ventana nativa en el compositor del kernel
+                int wid = win_sys_create(x, y, w, h, title);
+                if (wid >= 0) {
+                    win_focus(wid);
+                    composer_dirty_window(wid);
+                }
+            }
+        }
+        break;
+    }
+
+    case SYS_CLEAR: {
+        // clear(color=ebx) — placeholder
+        break;
+    }
+
+    default: {
+        kprintf("[Syscall desconocida: %u]\n", eax);
+        break;
+    }
+    }
+}
+
+************
+
+************
+ARCHIVO: usermode.asm
+************
+format ELF
+use32
+
+public enter_user_mode
+public user_mode_entry
+
+section '.text' executable
+
+; void enter_user_mode(uint32_t entry, uint32_t user_stack);
+enter_user_mode:
+    mov eax, [esp + 4]      ; EIP
+    mov edx, [esp + 8]      ; ESP de usuario
+
+    cli
+
+    ; Frame del iretd
+    push 0x23               ; SS (DPL=3)
+    push edx                ; ESP
+    push 0x202              ; EFLAGS (IF=1, bit1 reservado=1)
+    push 0x1B               ; CS (DPL=3)
+    push eax                ; EIP
+
+    ; ⚠️ CRÍTICO: recargar DS/ES/FS/GS con el selector de usuario.
+    ; Es legal hacerlo desde Ring 0 porque DPL(0x23)=3 >= max(CPL=0, RPL=3).
+    mov ax, 0x23
+    mov ds, ax
+    mov es, ax
+    mov fs, ax
+    mov gs, ax
+
+    iretd
+
+; void user_mode_entry(uint32_t eip, uint32_t esp, uint32_t eflags, uint32_t cs, uint32_t ss);
+user_mode_entry:
+    mov eax, [esp + 4]      ; eip
+    mov edx, [esp + 8]      ; esp
+    mov ecx, [esp + 12]     ; eflags
+    mov ebx, [esp + 16]     ; cs
+    mov esi, [esp + 20]     ; ss
+
+    cli
+    push esi                ; SS
+    push edx                ; ESP
+    push ecx                ; EFLAGS
+    push ebx                ; CS
+    push eax                ; EIP
+
+    mov ax, si              ; si = ss = 0x23
+    mov ds, ax
+    mov es, ax
+    mov fs, ax
+    mov gs, ax
+
+    iretd
+
+************
+

@@ -1,36 +1,23 @@
-// Copyright (C) 2026 Samuel Tamayo Infante
-//
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-//
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU General Public License for more details.
-//
-// You should have received a copy of the GNU General Public License
-// along with this program.  If not, see <https://www.gnu.org/licenses/>.
-
+// ring3_test.cpp
 #include "screen.h"
 #include "paging.h"
 #include "tss.h"
 #include "fat32.h"
 #include "ahci.h"
+#include "process.h"
+#include "thread.h"   // NUEVO: Necesario para crear el hilo puente
 
-#define USER_CODE           0x08000000u
-#define USER_STACK_BASE     0x08010000u
+// Tamaño de la pila de usuario
 #define USER_STACK_SIZE     0x4000u
-#define USER_STACK_TOP      0x08014000u
 
 static uint8_t file_buffer[65536];
 static uint8_t ring3_kernel_stack[8192] __attribute__((aligned(16)));
 
-// Variables para el contexto de retorno (Longjmp)
-unsigned int kernel_esp_save = 0;
-unsigned int kernel_eip_save = 0;
+// Variables globales para pasar los datos al hilo puente
+static uint32_t global_entry = 0;
+static uint32_t global_stack = 0;
 
+// Estructuras ELF
 typedef struct {
     unsigned char e_ident[16];
     uint16_t e_type;
@@ -66,12 +53,10 @@ extern "C" void paging_map(unsigned int virt, unsigned int phys, unsigned int fl
 extern "C" int fat32_read_cluster_raw(uint32_t cluster, void *buf);
 extern "C" uint32_t fat32_next_cluster(uint32_t current);
 
-// Variables para la búsqueda de archivos
 static uint32_t found_cluster = 0;
 static uint32_t found_size = 0;
 static const char* target_filename = 0;
 
-// Compara un nombre de archivo FAT32 con el nombre buscado
 static int str_match(const char *s1, const char *s2, int max_len) {
     for (int i = 0; i < max_len; i++) {
         char c1 = s1[i];
@@ -84,9 +69,8 @@ static int str_match(const char *s1, const char *s2, int max_len) {
     return 1;
 }
 
-// Callback que busca el archivo en el directorio
 static void find_file_cb(const char *name, uint32_t size, uint8_t attr, uint32_t cluster) {
-    if (attr & 0x10) return; // Ignorar directorios
+    if (attr & 0x10) return;
     if (str_match(name, target_filename, 11)) {
         found_cluster = cluster;
         found_size = size;
@@ -94,48 +78,57 @@ static void find_file_cb(const char *name, uint32_t size, uint8_t attr, uint32_t
 }
 
 // =====================================================================
-// FUNCIÓN DE RETORNO (LONGJMP)
-// Esta función es llamada por SYS_EXIT para restaurar el kernel.
+// HILO PUENTE: Se ejecuta en Ring 0 y hace el salto a Ring 3
 // =====================================================================
-extern "C" void ring3_volver_kernel(void) {
-    // Restauramos el stack pointer y saltamos al punto de retorno
-    asm volatile(
-        "mov %0, %%esp\n"
-        "jmp *%1\n"
-        :: "r"(kernel_esp_save), "r"(kernel_eip_save)
-    );
+static void jump_thread_func(void) {
+    kprintf("jump_thread: Saltando a Ring 3 (Entry=0x%x)\n", global_entry);
+    
+    // Hacemos el salto usando la función original de ensamblador
+    enter_user_mode(global_entry, global_stack);
+    
+    // Si el programa de usuario termina y vuelve aquí, matamos el hilo
+    thread_exit();
 }
 
 // =====================================================================
-// CARGADOR UNIVERSAL DE ELF
+// CARGADOR
 // =====================================================================
 extern "C" int ring3_execute(const char *filename) {
     kprintf("ring3: Iniciando programa '%s'...\n", filename);
 
+    uint32_t base_addr = 0;
+    uint32_t stack_top = 0;
+    
+    // Pedir hueco al gestor de procesos (process.cpp)
+    int pid = process_alloc(filename, &base_addr, &stack_top);
+    if (pid < 0) return -1;
+
+    // Asegurar FAT32
     if (!fat32_is_mounted()) {
         uint32_t lba = fat32_scan();
-        if (!lba || !fat32_mount(lba)) {
-            kprintf("ring3: Error FAT32 no montado\n");
-            return -1;
-        }
+        if (!lba || !fat32_mount(lba)) { process_free(pid); return -1; }
     }
 
+    // Buscar el archivo
     found_cluster = 0;
     found_size = 0;
     target_filename = filename;
     fat32_list("/", find_file_cb);
 
     if (found_cluster == 0) {
-        kprintf("ring3: Error: Archivo '%s' no encontrado.\n", filename);
+        kprintf("ring3: Archivo no encontrado\n");
+        process_free(pid);
         return -1;
     }
 
     uint32_t bytes_to_read = found_size;
     if (bytes_to_read > sizeof(file_buffer)) {
-        kprintf("ring3: Error: El archivo excede el buffer (max 64KB).\n");
+        kprintf("ring3: Archivo demasiado grande\n");
+        process_free(pid);
         return -1;
     }
 
+    // Leer el archivo a memoria temporal
     uint32_t cluster = found_cluster;
     uint32_t copied = 0;
     uint8_t *out = file_buffer;
@@ -148,25 +141,28 @@ extern "C" int ring3_execute(const char *filename) {
         cluster = fat32_next_cluster(cluster);
     }
 
+    // Validar ELF
     Elf32_Ehdr *ehdr = (Elf32_Ehdr *)file_buffer;
     if (ehdr->e_ident[0] != 0x7F || ehdr->e_ident[1] != 'E' ||
         ehdr->e_ident[2] != 'L' || ehdr->e_ident[3] != 'F') {
-        kprintf("ring3: Error: Formato ELF inválido.\n");
+        kprintf("ring3: Formato ELF invalido\n");
+        process_free(pid);
         return -1;
     }
 
-    // Mapear pila de usuario
+    // Mapear pila de usuario (dentro del bloque asignado por process_alloc)
+    uint32_t user_stack_base = base_addr + 0x10000; 
     for (uint32_t off = 0; off < USER_STACK_SIZE; off += 0x1000) {
-        paging_map(USER_STACK_BASE + off, USER_STACK_BASE + off, PTE_PRESENT | PTE_RW | PTE_USER);
+        paging_map(user_stack_base + off, user_stack_base + off, PTE_PRESENT | PTE_RW | PTE_USER);
     }
 
-    // Mapear framebuffer
+    // Mapear el framebuffer
     uint32_t fb_addr = *(uint32_t*)0x6004;
     for (uint32_t off = 0; off < 1024 * 768 * 4; off += 0x1000) {
         paging_map(fb_addr + off, fb_addr + off, PTE_PRESENT | PTE_RW | PTE_USER | PTE_PAT);
     }
 
-    // Cargar segmentos PT_LOAD
+    // Cargar segmentos PT_LOAD (Usamos direcciones absolutas, sin sumar base_addr)
     Elf32_Phdr *phdr = (Elf32_Phdr *)(file_buffer + ehdr->e_phoff);
     for (int i = 0; i < ehdr->e_phnum; i++) {
         if (phdr[i].p_type == PT_LOAD) {
@@ -177,7 +173,7 @@ extern "C" int ring3_execute(const char *filename) {
                 paging_map(addr, addr, PTE_PRESENT | PTE_RW | PTE_USER);
             }
 
-            uint8_t *dest = (uint8_t *)phdr[i].p_vaddr;
+            uint8_t *dest = (uint8_t *)(phdr[i].p_vaddr);
             uint8_t *src  = file_buffer + phdr[i].p_offset;
 
             for (uint32_t j = 0; j < phdr[i].p_filesz; j++) dest[j] = src[j];
@@ -185,37 +181,28 @@ extern "C" int ring3_execute(const char *filename) {
         }
     }
 
+    // Flush TLB
     asm volatile("mov %%cr3, %%eax; mov %%eax, %%cr3" ::: "eax", "memory");
 
+    // Configurar pila del kernel para el TSS
     uint32_t esp0 = (uint32_t)(ring3_kernel_stack + sizeof(ring3_kernel_stack));
     esp0 &= ~0xFu;
     tss_set_kernel_stack(esp0);
 
-    kprintf("ring3: Entry = 0x%x | Stack = 0x%x\n", ehdr->e_entry, USER_STACK_TOP);
+    // Preparar las variables globales para el hilo puente
+    global_entry = ehdr->e_entry;
+    global_stack = user_stack_base + USER_STACK_SIZE - 16;
 
-    // -----------------------------------------------------------------
-    // GUARDAR CONTEXTO (LONGJMP)
-    // Guardamos el ESP y el EIP de retorno (etiqueta .return_point)
-    // -----------------------------------------------------------------
-    asm volatile(
-        "mov %%esp, %0\n"
-        "mov $1f, %1\n"         // Carga la dirección de la etiqueta local 1f
-        : "=m"(kernel_esp_save), "=m"(kernel_eip_save)
-        :
-        : "memory"
-    );
+    kprintf("ring3: Creando hilo puente en Ring 0...\n");
+    
+    // Crear el hilo de KERNEL que hará el salto
+    int tid = thread_create(filename, jump_thread_func);
+    if (tid < 0) {
+        kprintf("ring3: Error al crear hilo (tabla llena)\n");
+        process_free(pid);
+        return -1;
+    }
 
-    kprintf("ring3: SALTANDO a Ring 3...\n");
-
-    enter_user_mode(ehdr->e_entry, USER_STACK_TOP);
-
-    // -----------------------------------------------------------------
-    // PUNTO DE RETORNO
-    // El SYS_EXIT hará un jmp aquí, restaurando el ESP previamente.
-    // -----------------------------------------------------------------
-    asm volatile("1:"); // Esta es la etiqueta 1f referenciada arriba
-
-    kprintf(">> Programa finalizado. De vuelta en el cargador.\n");
-
+    kprintf("ring3: Hilo creado. Multitarea activa.\n");
     return 0;
 }

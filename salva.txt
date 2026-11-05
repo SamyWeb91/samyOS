@@ -1,0 +1,630 @@
+************
+ARCHIVO: ring3_test.cpp.bak
+************
+// ring3_test.cpp
+#include "screen.h"
+#include "paging.h"
+#include "tss.h"
+#include "fat32.h"
+#include "ahci.h"
+#include "process.h"
+
+// Ya no usamos 0x08000000 fijo, ahora se calcula por proceso
+#define USER_STACK_SIZE     0x4000u
+
+static uint8_t file_buffer[65536];
+static uint8_t ring3_kernel_stack[8192] __attribute__((aligned(16)));
+
+// Variables para el contexto de retorno (Longjmp)
+unsigned int kernel_esp_save = 0;
+unsigned int kernel_eip_save = 0;
+static int current_running_pid = -1; // Para saber a quién liberar
+
+// ... (Las estructuras ELF se mantienen igual) ...
+typedef struct {
+    unsigned char e_ident[16];
+    uint16_t e_type;
+    uint16_t e_machine;
+    uint32_t e_version;
+    uint32_t e_entry;
+    uint32_t e_phoff;
+    uint32_t e_shoff;
+    uint32_t e_flags;
+    uint16_t e_ehsize;
+    uint16_t e_phentsize;
+    uint16_t e_phnum;
+    uint16_t e_shentsize;
+    uint16_t e_shnum;
+    uint16_t e_shstrndx;
+} Elf32_Ehdr;
+
+typedef struct {
+    uint32_t p_type;
+    uint32_t p_offset;
+    uint32_t p_vaddr;
+    uint32_t p_paddr;
+    uint32_t p_filesz;
+    uint32_t p_memsz;
+    uint32_t p_flags;
+    uint32_t p_align;
+} Elf32_Phdr;
+
+#define PT_LOAD 1
+
+extern "C" void enter_user_mode(uint32_t entry, uint32_t user_stack);
+extern "C" void paging_map(unsigned int virt, unsigned int phys, unsigned int flags);
+extern "C" int fat32_read_cluster_raw(uint32_t cluster, void *buf);
+extern "C" uint32_t fat32_next_cluster(uint32_t current);
+
+static uint32_t found_cluster = 0;
+static uint32_t found_size = 0;
+static const char* target_filename = 0;
+
+static int str_match(const char *s1, const char *s2, int max_len) {
+    for (int i = 0; i < max_len; i++) {
+        char c1 = s1[i];
+        char c2 = s2[i];
+        if (c2 == '\0') {
+            return (c1 == ' ' || c1 == '\0');
+        }
+        if (c1 != c2) return 0;
+    }
+    return 1;
+}
+
+static void find_file_cb(const char *name, uint32_t size, uint8_t attr, uint32_t cluster) {
+    if (attr & 0x10) return;
+    if (str_match(name, target_filename, 11)) {
+        found_cluster = cluster;
+        found_size = size;
+    }
+}
+
+extern "C" void ring3_volver_kernel(void) {
+    asm volatile(
+        "mov %0, %%esp\n"
+        "jmp *%1\n"
+        :: "r"(kernel_esp_save), "r"(kernel_eip_save)
+    );
+}
+
+extern "C" int ring3_execute(const char *filename) {
+    kprintf("ring3: Iniciando programa '%s'...\n", filename);
+
+    // 1. Pedir hueco al gestor de procesos
+    uint32_t base_addr = 0;
+    uint32_t stack_top = 0;
+    int pid = process_alloc(filename, &base_addr, &stack_top);
+    
+    if (pid < 0) {
+        return -1; // Tabla llena
+    }
+    current_running_pid = pid;
+
+    // 2. Leer el archivo de FAT32
+    if (!fat32_is_mounted()) {
+        uint32_t lba = fat32_scan();
+        if (!lba || !fat32_mount(lba)) {
+            process_free(pid);
+            return -1;
+        }
+    }
+
+    found_cluster = 0;
+    found_size = 0;
+    target_filename = filename;
+    fat32_list("/", find_file_cb);
+
+    if (found_cluster == 0) {
+        process_free(pid);
+        return -1;
+    }
+
+    uint32_t bytes_to_read = found_size;
+    if (bytes_to_read > sizeof(file_buffer)) {
+        process_free(pid);
+        return -1;
+    }
+
+    uint32_t cluster = found_cluster;
+    uint32_t copied = 0;
+    uint8_t *out = file_buffer;
+
+    while (cluster >= 2 && cluster < FAT32_CLUSTER_EOC && copied < bytes_to_read) {
+        if (!fat32_read_cluster_raw(cluster, out + copied)) break;
+        uint32_t chunk = 4096;
+        if (chunk > bytes_to_read - copied) chunk = bytes_to_read - copied;
+        copied += chunk;
+        cluster = fat32_next_cluster(cluster);
+    }
+
+    Elf32_Ehdr *ehdr = (Elf32_Ehdr *)file_buffer;
+    if (ehdr->e_ident[0] != 0x7F || ehdr->e_ident[1] != 'E' ||
+        ehdr->e_ident[2] != 'L' || ehdr->e_ident[3] != 'F') {
+        process_free(pid);
+        return -1;
+    }
+
+    // 3. Mapear la pila de usuario en la dirección asignada
+    uint32_t user_stack_base = base_addr + 0x10000; 
+    for (uint32_t off = 0; off < USER_STACK_SIZE; off += 0x1000) {
+        paging_map(user_stack_base + off, user_stack_base + off, PTE_PRESENT | PTE_RW | PTE_USER);
+    }
+
+    // 4. Mapear el framebuffer (compartido para todos)
+    uint32_t fb_addr = *(uint32_t*)0x6004;
+    for (uint32_t off = 0; off < 1024 * 768 * 4; off += 0x1000) {
+        paging_map(fb_addr + off, fb_addr + off, PTE_PRESENT | PTE_RW | PTE_USER | PTE_PAT);
+    }
+
+    // 5. Cargar segmentos PT_LOAD en la nueva dirección base
+    Elf32_Phdr *phdr = (Elf32_Phdr *)(file_buffer + ehdr->e_phoff);
+    for (int i = 0; i < ehdr->e_phnum; i++) {
+        if (phdr[i].p_type == PT_LOAD) {
+            // Sumamos la base a las direcciones virtuales del ELF
+            uint32_t elf_vaddr = phdr[i].p_vaddr;
+            uint32_t vaddr_start = (base_addr + elf_vaddr) & ~0xFFFu;
+            uint32_t vaddr_end   = (base_addr + elf_vaddr + phdr[i].p_memsz + 0xFFF) & ~0xFFFu;
+
+            for (uint32_t addr = vaddr_start; addr < vaddr_end; addr += 0x1000) {
+                paging_map(addr, addr, PTE_PRESENT | PTE_RW | PTE_USER);
+            }
+
+            // Copiamos el código sumando la base
+            uint8_t *dest = (uint8_t *)(base_addr + elf_vaddr);
+            uint8_t *src  = file_buffer + phdr[i].p_offset;
+
+            for (uint32_t j = 0; j < phdr[i].p_filesz; j++) dest[j] = src[j];
+            for (uint32_t j = phdr[i].p_filesz; j < phdr[i].p_memsz; j++) dest[j] = 0;
+        }
+    }
+
+    asm volatile("mov %%cr3, %%eax; mov %%eax, %%cr3" ::: "eax", "memory");
+
+    uint32_t esp0 = (uint32_t)(ring3_kernel_stack + sizeof(ring3_kernel_stack));
+    esp0 &= ~0xFu;
+    tss_set_kernel_stack(esp0);
+
+    // Calculamos el punto de entrada final
+    uint32_t final_entry = base_addr + ehdr->e_entry;
+    
+    kprintf("ring3: Entry = 0x%x | Stack = 0x%x\n", final_entry, user_stack_base + USER_STACK_SIZE);
+
+    // 6. Guardar contexto para el Longjmp
+    asm volatile(
+        "mov %%esp, %0\n"
+        "mov $1f, %1\n"
+        : "=m"(kernel_esp_save), "=m"(kernel_eip_save)
+        :
+        : "memory"
+    );
+
+    kprintf("ring3: SALTANDO a Ring 3...\n");
+
+    enter_user_mode(final_entry, user_stack_base + USER_STACK_SIZE - 16);
+
+    // 7. Punto de retorno (cuando el programa hace SYS_EXIT)
+    asm volatile("1:");
+
+    kprintf(">> Programa finalizado. De vuelta en el cargador.\n");
+    
+    // Liberar el proceso
+    process_free(current_running_pid);
+    current_running_pid = -1;
+
+    return 0;
+}
+
+************
+
+************
+ARCHIVO: syscall.cpp.bak
+************
+// Copyright (C) 2026 Samuel Tamayo Infante
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+#include "syscall.h"
+#include "screen.h"
+#include "idt.h"
+#include "gfx.h"
+#include "win.h"      // Necesario para win_sys_create
+#include "composer.h" // Necesario para composer_dirty_window
+
+// =====================================================================
+// Números de syscall — DEBEN COINCIDIR con el programa de usuario
+// =====================================================================
+#define SYS_EXIT          0
+#define SYS_WRITE         1
+#define SYS_READ          2
+#define SYS_OPEN          3
+#define SYS_CLOSE         4
+#define SYS_DRAW_RECT     11
+#define SYS_CLEAR         12
+#define SYS_DRAW_TEXT     13
+#define SYS_CREATE_WINDOW 14
+
+extern "C" void isr_128();
+
+// Variable externa del cargador (ring3_test.cpp)
+extern "C" void ring3_volver_kernel(void);
+
+extern "C" void syscall_init(void) {
+    // DPL=3 (0xEE) para que int 0x80 funcione desde Ring 3.
+    idt_set_gate(0x80, (unsigned int)isr_128, 0x08, 0xEE);
+    kprintf("Syscall: int 0x80 registrado (DPL=3)\n");
+}
+
+// =====================================================================
+// Handler de syscalls.
+// Firma de 6 argumentos (eax, ebx, ecx, edx, esi, edi).
+// =====================================================================
+extern "C" void syscall_handler_c(uint32_t eax, uint32_t ebx, uint32_t ecx, uint32_t edx, uint32_t esi, uint32_t edi) {
+    switch (eax) {
+
+    case SYS_EXIT: {
+        kprintf("\n[Syscall: exit(code=%u)]\n", ebx);
+        kprintf("Volviendo a la shell (Longjmp)...\n");
+
+        // Llamar al Longjmp del cargador. 
+        // Esta función no retorna: restaura el ESP y salta de vuelta al kernel.
+        ring3_volver_kernel();
+        
+        // Por si acaso, bucle infinito de seguridad (nunca debería llegar aquí)
+        while (1) { asm volatile("cli; hlt"); }
+        break;
+    }
+
+    case SYS_WRITE: {
+        if (ebx == 1) { // stdout
+            const char *buf = (const char *)ecx;
+            for (uint32_t i = 0; i < edx; i++) {
+                char s[2] = { buf[i], 0 };
+                kprintf("%s", s);
+            }
+        }
+        break;
+    }
+
+    case SYS_DRAW_RECT: {
+        // draw_rect(x=ebx, y=ecx, w=edx, h=esi, color=edi)
+        int x = (int)ebx;
+        int y = (int)ecx;
+        int w = (int)edx;
+        int h = (int)esi;
+        uint32_t color = edi;
+
+        if (w > 0 && w < 2048 && h > 0 && h < 2048) {
+            gfx_fill_rect(x, y, w, h, color);
+        }
+        break;
+    }
+
+    case SYS_DRAW_TEXT: {
+        // draw_text(x=ebx, y=ecx, color=edx, str=esi)
+        int x = (int)ebx;
+        int y = (int)ecx;
+        uint32_t color = edx;
+        const char *str = (const char *)esi;
+
+        // Verificación básica de puntero (debe estar en el rango mapeado de Ring 3)
+        if (str && (uint32_t)str >= 0x08000000 && (uint32_t)str < 0x08400000) {
+            // Tu gfx.h requiere (x, y, string, fg_color, bg_color)
+            // Usaremos 0 como fondo transparente (o negro si tu driver lo requiere)
+            gfx_draw_string(x, y, str, color, 0); 
+        }
+        break;
+    }
+
+    case SYS_CREATE_WINDOW: {
+        // create_window(x=ebx, y=ecx, w=edx, h=esi, title=edi)
+        int x = (int)ebx;
+        int y = (int)ecx;
+        int w = (int)edx;
+        int h = (int)esi;
+        const char *title = (const char *)edi;
+
+        if (title && (uint32_t)title >= 0x08000000 && (uint32_t)title < 0x08400000) {
+            if (w > 0 && w < 1024 && h > 0 && h < 768) {
+                // Crea una ventana nativa en el compositor del kernel
+                int wid = win_sys_create(x, y, w, h, title);
+                if (wid >= 0) {
+                    win_focus(wid);
+                    composer_dirty_window(wid);
+                }
+            }
+        }
+        break;
+    }
+
+    case SYS_CLEAR: {
+        // clear(color=ebx) — placeholder
+        break;
+    }
+
+    default: {
+        kprintf("[Syscall desconocida: %u]\n", eax);
+        break;
+    }
+    }
+}
+
+************
+
+************
+ARCHIVO: thread.cpp
+************
+// Copyright (C) 2026 Samuel Tamayo Infante
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+#include "thread.h"
+#include "screen.h"
+
+extern "C" void context_switch(uint32_t *old_esp, uint32_t new_esp);
+extern "C" void thread_entry_trampoline(void);
+extern "C" void user_mode_entry(uint32_t eip, uint32_t esp, uint32_t eflags, uint32_t cs, uint32_t ss);
+
+static Thread threads[THREAD_MAX];
+static int    thread_count = 0;
+static int    current = 0;
+static volatile int in_schedule = 0;
+
+static uint8_t thread_stacks[THREAD_MAX][THREAD_STACK] __attribute__((aligned(16)));
+static void (*thread_entries[THREAD_MAX])(void);
+static unsigned int thread_ticks[THREAD_MAX];
+
+extern "C" void thread_trampoline_c(void) {
+    int id = current;
+    void (*fn)(void) = thread_entries[id];
+    thread_entries[id] = 0;
+    if (fn) fn();
+    thread_exit();
+    while (1) {}
+}
+
+extern "C" void thread_init(void) {
+    for (int i = 0; i < THREAD_MAX; i++) {
+        threads[i].esp = 0;
+        threads[i].state = TH_ZOMBIE;
+        threads[i].name[0] = 0;
+        thread_entries[i] = 0;
+        thread_ticks[i] = 0;
+        threads[i].user_eip = 0;
+    }
+
+    current = 0;
+    threads[0].state = TH_RUNNING;
+    threads[0].id = 0;
+    threads[0].priority = 1;
+    
+    uint32_t kmain_esp;
+    asm volatile("mov %%esp, %0" : "=r"(kmain_esp));
+    threads[0].esp = kmain_esp;
+    
+    const char *n = "kmain";
+    int k = 0; while (n[k] && k < THREAD_NAME_MAX - 1) { threads[0].name[k] = n[k]; k++; }
+    threads[0].name[k] = 0;
+    thread_count = 1;
+
+    kprintf("Threads: init (%d max) kmain esp=%x\n", THREAD_MAX, kmain_esp);
+}
+
+extern "C" int thread_create(const char *name, void (*entry)(void)) {
+    if (thread_count >= THREAD_MAX || !entry) return -1;
+    int idx = -1;
+    for (int i = 1; i < THREAD_MAX; i++) {
+        if (threads[i].state == TH_ZOMBIE && threads[i].name[0] == 0) { idx = i; break; }
+    }
+    if (idx < 0) return -1;
+
+    uint8_t *stack = thread_stacks[idx];
+    int k = 0; while (name[k] && k < THREAD_NAME_MAX - 1) { threads[idx].name[k] = name[k]; k++; }
+    threads[idx].name[k] = 0;
+    
+    threads[idx].id = idx;
+    threads[idx].stack_base = (uint32_t)stack;
+    threads[idx].stack_size = THREAD_STACK;
+    threads[idx].state = TH_READY;
+    threads[idx].priority = 1;
+    thread_entries[idx] = entry;
+    thread_ticks[idx] = 0;
+    threads[idx].user_eip = 0; // No es de usuario
+
+    uint32_t *sp = (uint32_t *)(stack + THREAD_STACK);
+    *--sp = (uint32_t)thread_entry_trampoline;
+    *--sp = 0x202;
+    *--sp = 0; *--sp = 0; *--sp = 0; *--sp = 0; *--sp = 0; *--sp = 0; *--sp = 0; *--sp = 0;
+
+    threads[idx].esp = (uint32_t)sp;
+    thread_count++;
+    return idx;
+}
+
+// =====================================================================
+// Crear hilo de Usuario (Ring 3)
+// =====================================================================
+extern "C" int thread_create_user(const char *name, uint32_t eip, uint32_t esp) {
+    if (thread_count >= THREAD_MAX) return -1;
+    int idx = -1;
+    for (int i = 1; i < THREAD_MAX; i++) {
+        if (threads[i].state == TH_ZOMBIE && threads[i].name[0] == 0) { idx = i; break; }
+    }
+    if (idx < 0) return -1;
+
+    int k = 0; while (name[k] && k < THREAD_NAME_MAX - 1) { threads[idx].name[k] = name[k]; k++; }
+    threads[idx].name[k] = 0;
+    
+    threads[idx].id = idx;
+    threads[idx].state = TH_USER;
+    threads[idx].priority = 1;
+    thread_ticks[idx] = 0;
+    
+    // Contexto de usuario
+    threads[idx].user_eip = eip;
+    threads[idx].user_esp = esp;
+    threads[idx].user_eflags = 0x202;
+    threads[idx].user_cs = 0x1B;
+    threads[idx].user_ss = 0x23;
+
+    // Pila del kernel (para cuando entre por interrupciones/syscalls)
+    uint8_t *stack = thread_stacks[idx];
+    uint32_t *sp = (uint32_t *)(stack + THREAD_STACK);
+    *--sp = 0; // ret dummy (no se usa en user_mode_entry)
+    *--sp = 0x202; 
+    *--sp = 0; *--sp = 0; *--sp = 0; *--sp = 0; *--sp = 0; *--sp = 0; *--sp = 0; *--sp = 0;
+    threads[idx].esp = (uint32_t)sp;
+    
+    thread_count++;
+    kprintf("Threads: USER '%s' (id=%d) eip=%x esp=%x\n", name, idx, eip, esp);
+    return idx;
+}
+
+extern "C" void schedule(void) {
+    uint32_t flags;
+    asm volatile("pushf; pop %0; cli" : "=r"(flags));
+
+    if (in_schedule) {
+        if (flags & 0x200) asm volatile("sti");
+        return;
+    }
+    in_schedule = 1;
+
+    thread_ticks[current]++;
+    if (thread_count <= 1) {
+        in_schedule = 0;
+        if (flags & 0x200) asm volatile("sti");
+        return;
+    }
+
+    int prev = current;
+    int next = -1;
+
+    // Buscar el siguiente hilo (READY, RUNNING o USER)
+    for (int i = 1; i <= THREAD_MAX; i++) {
+        int c = (prev + i) % THREAD_MAX;
+        if ((threads[c].state == TH_READY || threads[c].state == TH_USER) && threads[c].esp != 0) {
+            next = c;
+            break;
+        }
+    }
+
+    if (next < 0 || next == prev) {
+        in_schedule = 0;
+        if (flags & 0x200) asm volatile("sti");
+        return;
+    }
+
+    if (threads[prev].state == TH_RUNNING) threads[prev].state = TH_READY;
+    if (threads[next].state == TH_READY || threads[next].state == TH_USER) threads[next].state = TH_RUNNING;
+    
+    int was_user = threads[next].user_eip != 0;
+
+    current = next;
+    in_schedule = 0;
+
+    if (was_user) {
+        // SALTO A RING 3 (iretd)
+        user_mode_entry(threads[next].user_eip, threads[next].user_esp, 
+                        threads[next].user_eflags, threads[next].user_cs, threads[next].user_ss);
+    } else {
+        // CAMBIO DE CONTEXTO EN RING 0 (ret)
+        context_switch(&threads[prev].esp, threads[next].esp);
+    }
+    
+    if (flags & 0x200) asm volatile("sti");
+}
+
+extern "C" void thread_yield(void) {
+    schedule();
+}
+
+extern "C" void thread_exit(void) {
+    if (current <= 0) return;
+
+    asm volatile("cli");
+    threads[current].state      = TH_ZOMBIE;
+    threads[current].stack_base = 0;
+    threads[current].esp        = 0;
+    threads[current].stack_size = 0;
+    threads[current].priority   = 0;
+    threads[current].name[0]    = 0;
+    threads[current].user_eip   = 0;
+    thread_entries[current]     = 0;
+    thread_count--;
+    asm volatile("sti");
+
+    schedule();
+    while (1) {}
+}
+
+extern "C" int thread_kill(int id) {
+    if (id <= 0 || id >= THREAD_MAX) return -1;
+    if (threads[id].state == TH_ZOMBIE) return -1;
+
+    asm volatile("cli");
+    threads[id].state      = TH_ZOMBIE;
+    threads[id].stack_base = 0;
+    threads[id].esp        = 0;
+    threads[id].stack_size = 0;
+    threads[id].priority   = 0;
+    threads[id].name[0]    = 0;
+    threads[id].user_eip   = 0;
+    thread_entries[id]     = 0;
+    thread_count--;
+    asm volatile("sti");
+    return 0;
+}
+
+extern "C" int thread_current_id(void) { return current; }
+
+extern "C" void thread_set_priority(int id, int prio) {
+    if (id < 0 || id >= THREAD_MAX) return;
+    if (prio < 0) prio = 0;
+    if (prio > 20) prio = 20;
+    threads[id].priority = prio;
+}
+
+extern "C" void thread_list(void) {
+    const char *state_names[] = { "READY", "RUNNING", "BLOCKED", "ZOMBIE", "USER" };
+    kprintf("PID  NOMBRE      ESTADO    PRIO  TICKS\n");
+    for (int i = 0; i < THREAD_MAX; i++) {
+        if (threads[i].name[0] == 0) continue;
+        if (threads[i].state == TH_ZOMBIE && threads[i].esp == 0) continue;
+
+        kprintf("  %d  %s", i, threads[i].name);
+        int len = 0; while (threads[i].name[len]) len++;
+        for (int j = len; j < 10; j++) screen_putchar(' ');
+
+        kprintf("%s", state_names[threads[i].state]);
+        int sl = 0; while (state_names[threads[i].state][sl]) sl++;
+        for (int j = sl; j < 10; j++) screen_putchar(' ');
+
+        kprintf("%d    %u\n", threads[i].priority, thread_ticks[i]);
+    }
+}
+
+************
+

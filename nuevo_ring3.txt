@@ -1,0 +1,788 @@
+************
+ARCHIVO: ring3_test.cpp
+************
+// Copyright (C) 2026 Samuel Tamayo Infante
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+#include "screen.h"
+#include "paging.h"
+#include "tss.h"
+#include "fat32.h"
+#include "ahci.h"
+
+#define USER_CODE           0x08000000u
+#define USER_STACK_BASE     0x08010000u
+#define USER_STACK_SIZE     0x4000u
+#define USER_STACK_TOP      0x08014000u
+
+static uint8_t file_buffer[65536];
+static uint8_t ring3_kernel_stack[8192] __attribute__((aligned(16)));
+
+// Variables para el contexto de retorno (Longjmp)
+unsigned int kernel_esp_save = 0;
+unsigned int kernel_eip_save = 0;
+
+typedef struct {
+    unsigned char e_ident[16];
+    uint16_t e_type;
+    uint16_t e_machine;
+    uint32_t e_version;
+    uint32_t e_entry;
+    uint32_t e_phoff;
+    uint32_t e_shoff;
+    uint32_t e_flags;
+    uint16_t e_ehsize;
+    uint16_t e_phentsize;
+    uint16_t e_phnum;
+    uint16_t e_shentsize;
+    uint16_t e_shnum;
+    uint16_t e_shstrndx;
+} Elf32_Ehdr;
+
+typedef struct {
+    uint32_t p_type;
+    uint32_t p_offset;
+    uint32_t p_vaddr;
+    uint32_t p_paddr;
+    uint32_t p_filesz;
+    uint32_t p_memsz;
+    uint32_t p_flags;
+    uint32_t p_align;
+} Elf32_Phdr;
+
+#define PT_LOAD 1
+
+extern "C" void enter_user_mode(uint32_t entry, uint32_t user_stack);
+extern "C" void paging_map(unsigned int virt, unsigned int phys, unsigned int flags);
+extern "C" int fat32_read_cluster_raw(uint32_t cluster, void *buf);
+extern "C" uint32_t fat32_next_cluster(uint32_t current);
+
+// Variables para la búsqueda de archivos
+static uint32_t found_cluster = 0;
+static uint32_t found_size = 0;
+static const char* target_filename = 0;
+
+// Compara un nombre de archivo FAT32 con el nombre buscado
+static int str_match(const char *s1, const char *s2, int max_len) {
+    for (int i = 0; i < max_len; i++) {
+        char c1 = s1[i];
+        char c2 = s2[i];
+        if (c2 == '\0') {
+            return (c1 == ' ' || c1 == '\0');
+        }
+        if (c1 != c2) return 0;
+    }
+    return 1;
+}
+
+// Callback que busca el archivo en el directorio
+static void find_file_cb(const char *name, uint32_t size, uint8_t attr, uint32_t cluster) {
+    if (attr & 0x10) return; // Ignorar directorios
+    if (str_match(name, target_filename, 11)) {
+        found_cluster = cluster;
+        found_size = size;
+    }
+}
+
+// =====================================================================
+// FUNCIÓN DE RETORNO (LONGJMP)
+// Esta función es llamada por SYS_EXIT para restaurar el kernel.
+// =====================================================================
+extern "C" void ring3_volver_kernel(void) {
+    // Restauramos el stack pointer y saltamos al punto de retorno
+    asm volatile(
+        "mov %0, %%esp\n"
+        "jmp *%1\n"
+        :: "r"(kernel_esp_save), "r"(kernel_eip_save)
+    );
+}
+
+// =====================================================================
+// CARGADOR UNIVERSAL DE ELF
+// =====================================================================
+extern "C" int ring3_execute(const char *filename) {
+    kprintf("ring3: Iniciando programa '%s'...\n", filename);
+
+    if (!fat32_is_mounted()) {
+        uint32_t lba = fat32_scan();
+        if (!lba || !fat32_mount(lba)) {
+            kprintf("ring3: Error FAT32 no montado\n");
+            return -1;
+        }
+    }
+
+    found_cluster = 0;
+    found_size = 0;
+    target_filename = filename;
+    fat32_list("/", find_file_cb);
+
+    if (found_cluster == 0) {
+        kprintf("ring3: Error: Archivo '%s' no encontrado.\n", filename);
+        return -1;
+    }
+
+    uint32_t bytes_to_read = found_size;
+    if (bytes_to_read > sizeof(file_buffer)) {
+        kprintf("ring3: Error: El archivo excede el buffer (max 64KB).\n");
+        return -1;
+    }
+
+    uint32_t cluster = found_cluster;
+    uint32_t copied = 0;
+    uint8_t *out = file_buffer;
+
+    while (cluster >= 2 && cluster < FAT32_CLUSTER_EOC && copied < bytes_to_read) {
+        if (!fat32_read_cluster_raw(cluster, out + copied)) break;
+        uint32_t chunk = 4096;
+        if (chunk > bytes_to_read - copied) chunk = bytes_to_read - copied;
+        copied += chunk;
+        cluster = fat32_next_cluster(cluster);
+    }
+
+    Elf32_Ehdr *ehdr = (Elf32_Ehdr *)file_buffer;
+    if (ehdr->e_ident[0] != 0x7F || ehdr->e_ident[1] != 'E' ||
+        ehdr->e_ident[2] != 'L' || ehdr->e_ident[3] != 'F') {
+        kprintf("ring3: Error: Formato ELF inválido.\n");
+        return -1;
+    }
+
+    // Mapear pila de usuario
+    for (uint32_t off = 0; off < USER_STACK_SIZE; off += 0x1000) {
+        paging_map(USER_STACK_BASE + off, USER_STACK_BASE + off, PTE_PRESENT | PTE_RW | PTE_USER);
+    }
+
+    // Mapear framebuffer
+    uint32_t fb_addr = *(uint32_t*)0x6004;
+    for (uint32_t off = 0; off < 1024 * 768 * 4; off += 0x1000) {
+        paging_map(fb_addr + off, fb_addr + off, PTE_PRESENT | PTE_RW | PTE_USER | PTE_PAT);
+    }
+
+    // Cargar segmentos PT_LOAD
+    Elf32_Phdr *phdr = (Elf32_Phdr *)(file_buffer + ehdr->e_phoff);
+    for (int i = 0; i < ehdr->e_phnum; i++) {
+        if (phdr[i].p_type == PT_LOAD) {
+            uint32_t vaddr_start = phdr[i].p_vaddr & ~0xFFFu;
+            uint32_t vaddr_end   = (phdr[i].p_vaddr + phdr[i].p_memsz + 0xFFF) & ~0xFFFu;
+
+            for (uint32_t addr = vaddr_start; addr < vaddr_end; addr += 0x1000) {
+                paging_map(addr, addr, PTE_PRESENT | PTE_RW | PTE_USER);
+            }
+
+            uint8_t *dest = (uint8_t *)phdr[i].p_vaddr;
+            uint8_t *src  = file_buffer + phdr[i].p_offset;
+
+            for (uint32_t j = 0; j < phdr[i].p_filesz; j++) dest[j] = src[j];
+            for (uint32_t j = phdr[i].p_filesz; j < phdr[i].p_memsz; j++) dest[j] = 0;
+        }
+    }
+
+    asm volatile("mov %%cr3, %%eax; mov %%eax, %%cr3" ::: "eax", "memory");
+
+    uint32_t esp0 = (uint32_t)(ring3_kernel_stack + sizeof(ring3_kernel_stack));
+    esp0 &= ~0xFu;
+    tss_set_kernel_stack(esp0);
+
+    kprintf("ring3: Entry = 0x%x | Stack = 0x%x\n", ehdr->e_entry, USER_STACK_TOP);
+
+    // -----------------------------------------------------------------
+    // GUARDAR CONTEXTO (LONGJMP)
+    // Guardamos el ESP y el EIP de retorno (etiqueta .return_point)
+    // -----------------------------------------------------------------
+    asm volatile(
+        "mov %%esp, %0\n"
+        "mov $1f, %1\n"         // Carga la dirección de la etiqueta local 1f
+        : "=m"(kernel_esp_save), "=m"(kernel_eip_save)
+        :
+        : "memory"
+    );
+
+    kprintf("ring3: SALTANDO a Ring 3...\n");
+
+    enter_user_mode(ehdr->e_entry, USER_STACK_TOP);
+
+    // -----------------------------------------------------------------
+    // PUNTO DE RETORNO
+    // El SYS_EXIT hará un jmp aquí, restaurando el ESP previamente.
+    // -----------------------------------------------------------------
+    asm volatile("1:"); // Esta es la etiqueta 1f referenciada arriba
+
+    kprintf(">> Programa finalizado. De vuelta en el cargador.\n");
+
+    return 0;
+}
+
+************
+
+************
+ARCHIVO: shell.cpp
+************
+// Copyright (C) 2026 Samuel Tamayo Infante
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+// shell.cpp
+#include "shell.h"
+#include "win.h"
+#include "screen.h"
+#include "rtc.h"
+#include "pit.h"
+#include "composer.h"
+#include "ahci.h"
+#include "disk.h"
+#include "fat32.h"
+
+/* Cargador universal de programas en Ring 3 */
+extern "C" int ring3_execute(const char *filename);
+
+/* =====================================================================
+ * Forward declarations
+ * ===================================================================== */
+void term_print(int wid, const char *s);
+void term_println(int wid, const char *s);
+static void term_prompt(int wid);
+void print_uint(int wid, unsigned int v);
+static int  str_eq(const char *a, const char *b);
+static int  str_starts_with(const char *str, const char *prefix);
+static unsigned int str_len(const char *s);
+static void to_uppercase(char *str);
+
+/* =====================================================================
+ * Linea de entrada por terminal
+ * ===================================================================== */
+#define TERM_LINE_MAX 64
+
+typedef struct {
+    int  wid;
+    char line[TERM_LINE_MAX];
+    int  len;
+} ShellTerm;
+
+static ShellTerm terms[SHELL_MAX_TERMS];
+static int shell_ready = 0;
+
+/* =====================================================================
+ * Helpers de string
+ * ===================================================================== */
+static int str_eq(const char *a, const char *b) {
+    while (*a && *b) {
+        if (*a != *b) return 0;
+        a++; b++;
+    }
+    return *a == 0 && *b == 0;
+}
+
+static int str_starts_with(const char *str, const char *prefix) {
+    while (*prefix) {
+        if (*str != *prefix) return 0;
+        str++; prefix++;
+    }
+    return 1;
+}
+
+static unsigned int str_len(const char *s) {
+    unsigned int n = 0;
+    while (s[n]) n++;
+    return n;
+}
+
+static void to_uppercase(char *str) {
+    while (*str) {
+        if (*str >= 'a' && *str <= 'z') {
+            *str = *str - 'a' + 'A';
+        }
+        str++;
+    }
+}
+
+/* =====================================================================
+ * Helpers de impresion
+ * ===================================================================== */
+void term_print(int wid, const char *s) {
+    if (wid < 0) return;
+    int n = 0;
+    while (s[n]) n++;
+    win_sys_write(wid, s, n);
+}
+
+void term_println(int wid, const char *s) {
+    term_print(wid, s);
+    term_print(wid, "\n");
+}
+
+static void term_prompt(int wid) {
+    term_print(wid, "> ");
+}
+
+void print_uint(int wid, unsigned int v) {
+    char buf[16];
+    int n = 0;
+    if (v == 0) buf[n++] = '0';
+    while (v) { buf[n++] = '0' + (v % 10); v /= 10; }
+    char out[16];
+    int k = 0;
+    for (int i = n - 1; i >= 0; i--) out[k++] = buf[i];
+    out[k] = 0;
+    term_print(wid, out);
+}
+
+/* =====================================================================
+ * Callback para listar FAT32
+ * ===================================================================== */
+static void fat32_shell_list_cb(const char *name, uint32_t size, uint8_t attr, uint32_t cluster) {
+    (void)cluster;
+    int wid = win_get_focused();
+
+    term_print(wid, "  ");
+    term_print(wid, name);
+    for (unsigned int k = str_len(name); k < 20; k++) term_print(wid, " ");
+    if (attr & FAT32_ATTR_DIRECTORY) {
+        term_println(wid, "<DIR>");
+    } else {
+        print_uint(wid, size);
+        term_println(wid, " bytes");
+    }
+}
+
+/* =====================================================================
+ * Comandos
+ * ===================================================================== */
+static void cmd_help(int wid) {
+    term_println(wid, "Comandos:");
+    term_println(wid, "  help       - esta ayuda");
+    term_println(wid, "  clear      - limpiar terminal");
+    term_println(wid, "  date       - fecha y hora");
+    term_println(wid, "  ls         - listar archivos (FAT32)");
+    term_println(wid, "  cat <n>    - mostrar archivo (FAT32)");
+    term_println(wid, "  info       - info de FAT32 montada");
+    term_println(wid, "  disk       - estado del disco AHCI");
+    term_println(wid, "  partitions - lista particiones");
+    term_println(wid, "  hex <lba>  - volcar sector");
+    term_println(wid, "  run <n>    - ejecutar programa ELF en Ring 3");
+    term_println(wid, "  close      - cerrar esta ventana");
+}
+
+static void cmd_date(int wid) {
+    RTCTime t; rtc_read(&t);
+    char buf[20];
+    buf[0] = '0' + (t.day/10); buf[1] = '0' + (t.day%10); buf[2] = '/';
+    buf[3] = '0' + (t.month/10); buf[4] = '0' + (t.month%10); buf[5] = '/';
+    buf[6] = '0' + ((t.year/1000)%10); buf[7] = '0' + ((t.year/100)%10);
+    buf[8] = '0' + ((t.year/10)%10); buf[9] = '0' + (t.year%10);
+    buf[10] = ' '; buf[11] = '0' + (t.hour/10); buf[12] = '0' + (t.hour%10);
+    buf[13] = ':'; buf[14] = '0' + (t.minute/10); buf[15] = '0' + (t.minute%10);
+    buf[16] = 0;
+    term_println(wid, buf);
+}
+
+static void cmd_fatls(int wid, const char *path) {
+    if (!fat32_is_mounted()) {
+        term_println(wid, "ls: FAT32 no montada");
+        return;
+    }
+    if (!path || !*path) path = "/";
+    if (!fat32_list(path, fat32_shell_list_cb))
+        term_println(wid, "ls: error al listar");
+}
+
+static void cmd_fatcat(int wid, const char *name) {
+    if (!fat32_is_mounted()) {
+        term_println(wid, "cat: FAT32 no montada");
+        return;
+    }
+    if (!name || !*name) {
+        term_println(wid, "uso: cat <archivo>");
+        return;
+    }
+
+    static char buf[512]; // Estático para no inflar el stack
+    int r = fat32_read_file(name, buf, sizeof(buf) - 1);
+    if (r < 0) {
+        term_println(wid, "cat: error al leer archivo");
+        return;
+    }
+    buf[r] = 0;
+    term_println(wid, buf);
+}
+
+static void cmd_fatinfo(int wid) {
+    if (!fat32_is_mounted()) {
+        term_println(wid, "info: FAT32 no montada");
+        return;
+    }
+    const Fat32Volume *v = fat32_get_volume();
+    if (!v) return;
+
+    term_println(wid, "=== FAT32 Info ===");
+    term_print(wid, "Etiqueta: "); term_println(wid, v->volume_label);
+    term_print(wid, "LBA: "); print_uint(wid, v->part_lba); term_println(wid, "");
+}
+
+/* =====================================================================
+ * Dispatcher de comandos
+ * ===================================================================== */
+static void cmd_execute(int wid, ShellTerm *t, const char *cmd) {
+    if (cmd[0] == 0) return;
+
+    /* Comandos del disco */
+    if      (str_eq(cmd, "disk"))               disk_cmd_disk(wid);
+    else if (str_eq(cmd, "partitions"))         disk_cmd_partitions(wid);
+    else if (str_starts_with(cmd, "hex "))      disk_cmd_hex(wid, cmd + 4);
+
+    /* Comandos de FAT32 */
+    else if (str_eq(cmd, "ls"))                 cmd_fatls(wid, "/");
+    else if (str_starts_with(cmd, "ls "))       cmd_fatls(wid, cmd + 3);
+    else if (str_starts_with(cmd, "cat "))      cmd_fatcat(wid, cmd + 4);
+    else if (str_eq(cmd, "info"))               cmd_fatinfo(wid);
+
+    /* Comandos basicos */
+    else if (str_eq(cmd, "help"))         cmd_help(wid);
+    else if (str_eq(cmd, "clear"))        win_sys_clear(wid);
+    else if (str_eq(cmd, "date"))         cmd_date(wid);
+
+    /* Ejecutar programa de usuario (Ring 3) */
+    else if (str_starts_with(cmd, "run ")) {
+        char filename[TERM_LINE_MAX];
+        const char *arg = cmd + 4; // Saltamos "run "
+        
+        // Copiar argumento y convertir a mayúsculas para FAT32
+        int i = 0;
+        while (arg[i] && i < TERM_LINE_MAX - 1) {
+            filename[i] = arg[i];
+            i++;
+        }
+        filename[i] = 0;
+        to_uppercase(filename);
+
+        if (i == 0) {
+            term_println(wid, "uso: run <archivo.elf>");
+        } else {
+            term_print(wid, "Ejecutando: ");
+            term_println(wid, filename);
+            
+            // Llamar al cargador universal
+            int res = ring3_execute(filename);
+            
+            if (res == 0) {
+                term_println(wid, ">> Programa finalizado.");
+            } else {
+                term_println(wid, ">> Error al ejecutar programa.");
+            }
+        }
+    }
+
+    else if (str_eq(cmd, "close")) {
+        composer_dirty_window(wid);
+        t->wid = -1;
+        win_sys_destroy(wid);
+        return;
+    }
+    else {
+        term_print(wid, "Desconocido: ");
+        term_println(wid, cmd);
+    }
+}
+
+/* =====================================================================
+ * API publica
+ * ===================================================================== */
+extern "C" int shell_init(void) {
+    for (int i = 0; i < SHELL_MAX_TERMS; i++) {
+        terms[i].wid = -1;
+        terms[i].len = 0;
+        terms[i].line[0] = 0;
+    }
+    shell_ready = 1;
+    disk_init();
+    return 0;
+}
+
+extern "C" int shell_new_terminal(int x, int y, int w, int h, const char *title) {
+    if (!shell_ready) return -1;
+
+    int slot = -1;
+    for (int i = 0; i < SHELL_MAX_TERMS; i++) {
+        if (terms[i].wid < 0) { slot = i; break; }
+    }
+    if (slot < 0) return -1;
+
+    int wid = win_sys_create(x, y, w, h, title);
+    if (wid < 0) return -1;
+
+    win_focus(wid);
+    composer_dirty_window(wid);
+
+    terms[slot].wid = wid;
+    terms[slot].len = 0;
+    terms[slot].line[0] = 0;
+
+    term_println(wid, "MiniSO - Terminal grafica");
+    term_println(wid, "Escribe 'help' para ver comandos");
+    term_println(wid, "");
+    term_prompt(wid);
+
+    composer_dirty_window(wid);
+    return wid;
+}
+
+extern "C" void shell_handle_key(int wid, char c) {
+    if (wid < 0) return;
+
+    ShellTerm *t = 0;
+    for (int i = 0; i < SHELL_MAX_TERMS; i++) {
+        if (terms[i].wid == wid) { t = &terms[i]; break; }
+    }
+    if (!t) return;
+
+    if (c == 0x49) {  /* Page Up */
+        win_sys_scroll_up(wid);
+        composer_dirty_window(wid);
+        return;
+    }
+    if (c == 0x51) {  /* Page Down */
+        win_sys_scroll_down(wid);
+        composer_dirty_window(wid);
+        return;
+    }
+
+    if (c == '\n' || c == '\b' || (c >= 32 && c < 127)) {
+        win_sys_scroll_reset(wid);
+    }
+
+    if (c == '\n') {
+        win_sys_write(wid, "\n", 1);
+        t->line[t->len] = 0;
+        cmd_execute(wid, t, t->line);
+        t->len = 0;
+        if (t->wid < 0) return;
+        term_prompt(wid);
+        composer_dirty_window(wid);
+    }
+    else if (c == '\b') {
+        if (t->len > 0) {
+            t->len--;
+            win_sys_write(wid, "\b", 1);
+            composer_dirty_window(wid);
+        }
+    }
+    else if (c >= 32 && c < 127) {
+        if (t->len < TERM_LINE_MAX - 1) {
+            t->line[t->len++] = c;
+            char ch[2] = { c, 0 };
+            win_sys_write(wid, ch, 1);
+            composer_dirty_window(wid);
+        }
+    }
+}
+
+extern "C" void shell_close_terminal(int wid) {
+    for (int i = 0; i < SHELL_MAX_TERMS; i++) {
+        if (terms[i].wid == wid) {
+            terms[i].wid = -1;
+            terms[i].len = 0;
+            return;
+        }
+    }
+}
+
+/* Wrappers para disk.cpp */
+extern "C" void shell_term_print(int wid, const char *s) { term_print(wid, s); }
+extern "C" void shell_term_println(int wid, const char *s) { term_println(wid, s); }
+extern "C" void shell_print_uint(int wid, unsigned int v) { print_uint(wid, v); }
+
+extern "C" int shell_is_terminal(int wid) {
+    if (wid < 0) return 0;
+    for (int i = 0; i < SHELL_MAX_TERMS; i++) {
+        if (terms[i].wid == wid) return 1;
+    }
+    return 0;
+}
+
+************
+
+************
+ARCHIVO: paging.cpp
+************
+// Copyright (C) 2026 Samuel Tamayo Infante
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+#include "paging.h"
+#include "screen.h"
+
+static unsigned int page_directory[1024] __attribute__((aligned(4096)));
+static unsigned int page_table_0[1024]   __attribute__((aligned(4096)));
+
+#define PT_POOL_SIZE 64   // 32 PTs = 128 MB mapeables
+static unsigned int pt_pool[PT_POOL_SIZE][1024] __attribute__((aligned(4096)));
+static int pt_pool_next = 0;
+
+extern "C" void paging_enable_asm(unsigned int pd_phys);
+
+extern "C" void paging_init() {
+    for (int i = 0; i < 1024; i++) {
+        page_directory[i] = 0;
+        page_table_0[i]   = 0;
+    }
+
+    // Mapear los primeros 128 MB de RAM linealmente (identidad).
+    int PTs_needed = 32;   // 32 PTs * 4 MB = 128 MB
+    if (PTs_needed > PT_POOL_SIZE) PTs_needed = PT_POOL_SIZE;
+
+    for (int pt_i = 0; pt_i < PTs_needed; pt_i++) {
+        unsigned int *pt;
+        if (pt_i == 0) {
+            pt = page_table_0;
+        } else {
+            pt = pt_pool[pt_i];
+        }
+
+        unsigned int base_phys = pt_i * 0x400000;
+
+        for (int i = 0; i < 1024; i++) {
+            pt[i] = (base_phys + i * 0x1000) | PTE_PRESENT | PTE_RW;
+        }
+
+        page_directory[pt_i] = ((unsigned int)pt) | PTE_PRESENT | PTE_RW;
+    }
+
+    kprintf("paging: %d MB mapeados (0x0 - 0x%x)\n",
+            PTs_needed * 4, PTs_needed * 0x400000);
+}
+
+extern "C" void paging_enable_now() {
+    paging_enable_asm((unsigned int)page_directory);
+}
+
+extern "C" void paging_map(unsigned int virt, unsigned int phys, unsigned int flags) {
+    unsigned int pd_index = virt >> 22;
+    unsigned int pt_index = (virt >> 12) & 0x3FF;
+
+    if (!(page_directory[pd_index] & PTE_PRESENT)) {
+        if (pt_pool_next >= PT_POOL_SIZE) return;
+
+        unsigned int *new_pt = pt_pool[pt_pool_next++];
+        for (int i = 0; i < 1024; i++) new_pt[i] = 0;
+
+        unsigned int pde_flags = PTE_PRESENT | PTE_RW;
+        if (flags & PTE_USER) pde_flags |= PTE_USER;
+        
+        page_directory[pd_index] = ((unsigned int)new_pt) | pde_flags;
+    } else {
+        // Si el PDE ya existía (como los primeros 128 MB), le añadimos PTE_USER
+        if ((flags & PTE_USER) && !(page_directory[pd_index] & PTE_USER)) {
+            page_directory[pd_index] |= PTE_USER;
+        }
+    }
+
+    unsigned int *pt = (unsigned int*)(page_directory[pd_index] & 0xFFFFF000);
+    
+    // FIX CRÍTICO: Escribir el PTE asegurando que los flags de usuario se mantengan
+    // en el nivel inferior (Page Table). Si no hacemos esto, el iret fallará.
+    unsigned int new_pte = (phys & 0xFFFFF000) | PTE_PRESENT;
+    if (flags & PTE_RW)   new_pte |= PTE_RW;
+    if (flags & PTE_USER) new_pte |= PTE_USER;
+    if (flags & PTE_PAT)  new_pte |= PTE_PAT;
+
+    pt[pt_index] = new_pte;
+
+    asm volatile("invlpg (%0)" : : "r"(virt) : "memory");
+}
+
+extern "C" void paging_map_range(unsigned int virt, unsigned int phys, unsigned int size_kb, unsigned int flags) {
+    for (unsigned int i = 0; i < size_kb; i++) {
+        paging_map(virt + i * 0x1000, phys + i * 0x1000, flags);
+    }
+}
+
+extern "C" unsigned int paging_get_pd_addr()  { return (unsigned int)page_directory; }
+extern "C" unsigned int paging_get_pt0_addr() { return (unsigned int)page_table_0; }
+
+************
+
+************
+ARCHIVO: paging.h
+************
+/*
+ * Copyright (C) 2026 Samuel Tamayo Infante
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+// paging.h
+#pragma once
+
+/* =====================================================================
+ * Flags de PTE (Page Table Entry)
+ * ===================================================================== */
+#define PTE_PRESENT  0x001   /* Page present */
+#define PTE_RW       0x002   /* Read/Write */
+#define PTE_USER     0x004   /* Accesible desde ring 3 */
+#define PTE_PWT      0x008   /* Page Write-Through */
+#define PTE_PCD      0x010   /* Page Cache Disable */
+#define PTE_PAT      0x080   /* Page Attribute Table (bit 7 en PTE) */
+#define PTE_WC       (PTE_PWT | PTE_PCD)   /* Write-Combining (sin PAT) */
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+void paging_init();
+void paging_enable_now();
+
+void paging_map(unsigned int virt, unsigned int phys, unsigned int flags);
+void paging_map_range(unsigned int virt, unsigned int phys, unsigned int size_kb, unsigned int flags);
+
+unsigned int paging_get_pd_addr();
+unsigned int paging_get_pt0_addr();
+
+#ifdef __cplusplus
+}
+#endif
+
+************
+
